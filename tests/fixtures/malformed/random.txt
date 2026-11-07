@@ -1,0 +1,2 @@
+这不是订阅内容，只是一段普通文本。
+it contains no scheme, no yaml, no json.

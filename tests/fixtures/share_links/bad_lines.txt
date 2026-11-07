@@ -1,0 +1,6 @@
+vless://not-a-uuid@example.com:443#ok-ish
+http://example.com/sub
+ss://bm90LWJhc2U2NA==@example.com:8388
+vless://
+vmess://!!!notbase64!!!
+://missing-scheme

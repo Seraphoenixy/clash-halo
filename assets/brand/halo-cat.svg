@@ -1,0 +1,54 @@
+<svg width="300" height="300" viewBox="0 0 300 300" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    Clash Halo 品牌图标：猫头。
+
+    造型借鉴 Clash Verge Rev 的猫头，但走本项目自己的配色与构图：
+    紫罗兰实心圆底 + 白色猫脸剪影 + 青色（halo）光环。
+
+    设计约束（改动前请先读）：
+      * 16px 仍可辨识：不使用细节描边，只用大块形状；
+      * 单色可退：去掉 halo 环后仍是完整的猫头，供托盘/任务栏单色场景使用；
+      * 圆底留 8% 安全边距，避免 Windows 任务栏裁切。
+  -->
+  <circle cx="150" cy="150" r="150" fill="#6B4FBB"/>
+
+  <!-- halo：项目名里的“光环”，用青色与紫色形成对比 -->
+  <circle cx="150" cy="150" r="118" stroke="#5BD1E6" stroke-width="7" opacity="0.9"/>
+  <circle cx="150" cy="150" r="101" stroke="#FFFFFF" stroke-width="3" opacity="0.28"/>
+
+  <!-- 猫头：外轮廓（含双耳） -->
+  <path d="M150 78
+           C176 78 199 86 215 101
+           L231 74
+           C234 70 239 71 239 76
+           L239 128
+           C243 143 245 156 245 170
+           C245 217 203 250 150 250
+           C97 250 55 217 55 170
+           C55 156 57 143 61 128
+           L61 76
+           C61 71 66 70 69 74
+           L85 101
+           C101 86 124 78 150 78 Z"
+        fill="#FFFFFF"/>
+
+  <!-- 眼睛 -->
+  <ellipse cx="113" cy="163" rx="15" ry="19" fill="#3B2A6B"/>
+  <ellipse cx="187" cy="163" rx="15" ry="19" fill="#3B2A6B"/>
+  <circle cx="118" cy="156" r="5" fill="#FFFFFF"/>
+  <circle cx="192" cy="156" r="5" fill="#FFFFFF"/>
+
+  <!-- 鼻子与嘴 -->
+  <path d="M150 186 L140 178 C137 175 139 170 143 170 L157 170 C161 170 163 175 160 178 Z"
+        fill="#5BD1E6"/>
+  <path d="M150 188 C150 198 141 203 132 199"
+        stroke="#3B2A6B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M150 188 C150 198 159 203 168 199"
+        stroke="#3B2A6B" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- 胡须 -->
+  <path d="M92 168 L118 172" stroke="#3B2A6B" stroke-width="5" stroke-linecap="round" opacity="0.75"/>
+  <path d="M92 186 L118 182" stroke="#3B2A6B" stroke-width="5" stroke-linecap="round" opacity="0.75"/>
+  <path d="M208 168 L182 172" stroke="#3B2A6B" stroke-width="5" stroke-linecap="round" opacity="0.75"/>
+  <path d="M208 186 L182 182" stroke="#3B2A6B" stroke-width="5" stroke-linecap="round" opacity="0.75"/>
+</svg>

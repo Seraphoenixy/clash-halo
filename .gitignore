@@ -1,0 +1,55 @@
+.tools/
+.tmp/
+prototype/bin/
+prototype/runtime/
+**/.dart_tool/
+**/build/
+
+# tools/ 下的图标生成脚本是 Python 的
+__pycache__/
+*.pyc
+
+# ---------------------------------------------------------------------------
+# 运行日志
+#
+# 这些文件每次运行都会重写，内容随机器和时刻变化：提交它们只会让工作区
+# 永远处于"有改动"状态，diff 里也全是噪声。它们记录的是本地发生了什么，
+# 而不是项目是什么。
+#
+# 注意 `native/windows/internal/app/halo-core.log` 这种位置——内核日志是
+# 按当前工作目录写出的，所以它可能出现在仓库里任何一个子目录下，规则不能
+# 只匹配仓库根目录。
+*.log
+*.log.*
+**/halo-core.log
+**/core-output.log
+**/tun-core.log
+**/host.log
+**/flutter_*.log
+**/crash-*.log
+
+# 数据库与其 WAL/SHM 伴随文件：本地业务数据，不属于源码。
+*.db
+*.db-wal
+*.db-shm
+
+# ---------------------------------------------------------------------------
+# 界面截图 / 预览图
+#
+# docs/images/ 下全是"本机某一刻的样子"：窗口尺寸、缩放比例、当时的节点与
+# 订阅都写进了像素里。提交它们有三个代价，且都不小：
+#
+#   1. 每次核对界面都会改动一堆二进制，diff 里看不出改了什么，只看得到
+#      "13 files changed"；
+#   2. 任何一次 UI 调整都会让仓库里的截图变旧，而没人会记得同步更新——
+#      结果文档里挂着的是几版之前的界面；
+#   3. 一份 2360x1520 的 PNG 约 200 KB，几十张就是几 MB，永久留在历史里。
+#
+# 截图是**验证工具**，不是项目内容：需要时用脚本现生成。
+#
+#   pwsh -NoProfile -File scripts/capture-window.ps1 -Out docs/images/ui-overview.png
+#   py -3 tools/build-icons.py            # brand-cat*.png 预览
+#
+# 生成物因此整体忽略（含 review/ 等子目录）。脚本会自己建目录，clone 后
+# 目录不存在是正常的。
+docs/images/

@@ -1,0 +1,302 @@
+name: Build and Release
+
+# 与 D:\project\Ygdria 的 .github/workflows/build.yml 同构：
+#
+#   metadata → verify → windows → release
+#
+# 沿用的部分：tag（v*）或手动触发才出包、`needs` 串起来的依赖链、产物按固定名字
+# 上传、tag 构建末尾创建 draft release。不同的部分全部来自本项目的形态，写在下面
+# 每一步的注释里，最主要的三条是：
+#
+#   1. `.tools/` 不入库（.gitignore 第 1 行），本地那套 go/flutter 在 CI 里不存在，
+#      必须按版本装一套。
+#   2. `sing-box.exe` 79 MB 且不入库（prototype/bin 与 prototype/runtime 被忽略），
+#      必须从官方 release 下载并按 digest 校验——它是产品的一部分，不能"拿不到就跳过"。
+#   3. Windows 产物不是一个自包含前端，而是「外壳 + data/app.so + 自制宿主 + 第三方
+#      内核」，所以构建之后必须核对载荷，而不是看退出码。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A PR push supersedes the previous run for the same ref; a release build must
+# never be cancelled by a later commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # 与本地工具链一致。改这里之前先跑一遍 pwsh -File scripts/build-windows.ps1 确认
+  # 新版本能构建，否则 CI 会先于开发者发现不兼容。
+  FLUTTER_VERSION: "3.47.9"
+  GO_VERSION: "1.27.3"
+  # sing-box 的版本与 digest 来自官方 release：
+  #   https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.14.4
+  # digest 不是可选项：这个二进制会被安装包分发，也会由提权助手执行。
+  SING_BOX_VERSION: "1.14.4"
+  SING_BOX_ZIP_SHA256: "99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df"
+
+jobs:
+  metadata:
+    name: Determine release metadata
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      short_hash: ${{ steps.metadata.outputs.short_hash }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # 版本号只有一个来源：apps/flutter/pubspec.yaml。Ygdria 用 tag 或当天日期，
+      # 这里不能用日期——安装包的 DisplayVersion、文件属性、窗口「关于」都读同一个
+      # 值，随便造一个日期会让它们互相矛盾。tag 与 pubspec 不一致时报错，而不是
+      # 挑一个用。
+      - name: Determine version and commit
+        id: metadata
+        run: |
+          pubspec_version="$(sed -n 's/^version:[[:space:]]*//p' apps/flutter/pubspec.yaml | head -1 | tr -d '[:space:]')"
+          if [ -z "$pubspec_version" ]; then
+            echo "apps/flutter/pubspec.yaml 里没有 version 行" >&2
+            exit 1
+          fi
+          # 0.1.0+1 → 0.1.0：+1 是 build 号，不是版本号的一部分（见 docs/agents/build.md）。
+          version="${pubspec_version%%+*}"
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$version" ]; then
+              echo "tag $GITHUB_REF_NAME 与 pubspec 的版本 $version 不一致。" >&2
+              echo "先改 apps/flutter/pubspec.yaml，再打 tag。" >&2
+              exit 1
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_hash=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "pubspec=$pubspec_version" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Test
+    # Windows，不是 ubuntu：native/windows 是 Windows-only（golang.org/x/sys/windows、
+    # go-winio、TUN 助手的提权检查），在 Linux 上连编译都过不去。
+    runs-on: windows-latest
+    # Every push and every pull request. The earlier condition only ran on a tag
+    # or a manual dispatch, so main had no gate at all and a broken commit was
+    # discovered at release time.
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: native/windows/go.sum
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Fetch the locked sing-box core
+        shell: pwsh
+        run: ./scripts/fetch-singbox.ps1
+
+      - name: Resolve Dart dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: |
+          # Analyze the whole workspace in one pass; the workspace resolution means
+          # packages are covered too. This is the check that was actually failing
+          # before this workflow existed: four pre-existing warnings (a raw Map, an
+          # HTML-looking doc comment, an underscore-prefixed local, an undeclared
+          # halo_config import) made the analyzer exit non-zero, so CI would have
+          # been red on day one and stayed ignored. Those are fixed, not suppressed.
+          flutter analyze --no-pub
+
+      - name: Test Dart and Flutter
+        # scripts/test.ps1 is the documented entry point; running it here keeps CI
+        # and a developer's machine on the same commands.
+        #
+        # Every suite it supports is listed here, including 'flutter' — an earlier
+        # draft of this file looped over only the pure-Dart packages and silently
+        # skipped the 330 tests in apps/flutter, which is most of the suite.
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($suite in 'domain', 'contracts', 'storage', 'config', 'cli', 'flutter') {
+            Write-Output "== $suite =="
+            pwsh -NoProfile -File scripts/test.ps1 -Suite $suite
+            if ($LASTEXITCODE) { $failed += $suite }
+          }
+          if ($failed.Count -gt 0) { throw "失败的测试套件：$($failed -join '、')" }
+
+      - name: Test Go
+        shell: pwsh
+        run: |
+          # -count=1: a cached "ok" from an earlier run would hide a regression.
+          # The e2e suite needs the core staged next to the built host, which
+          # scripts/fetch-singbox.ps1 already put in prototype/bin.
+          Push-Location native/windows
+          try {
+            go vet ./...
+            if ($LASTEXITCODE) { throw 'go vet 失败' }
+            go test -count=1 -timeout 10m ./...
+            if ($LASTEXITCODE) { throw 'Go 测试失败' }
+          } finally { Pop-Location }
+
+      - name: Test the real IPC path
+        # host_live_test.dart is the only test that drives Dart FFI -> named
+        # pipe -> halo-host.exe. It skips itself unless both executables are
+        # supplied, which is why it never ran in CI; the production pipe path
+        # was only ever verified on a developer machine.
+        shell: pwsh
+        run: |
+          Push-Location native/windows
+          try {
+            go build -o ../../build/halo-host.exe ./cmd/halo-host
+            if ($LASTEXITCODE) { throw 'halo-host 构建失败' }
+          } finally { Pop-Location }
+          $env:HALO_HOST_EXE = (Resolve-Path build/halo-host.exe).Path
+          $env:HALO_CORE_EXE = (Resolve-Path prototype/bin/sing-box.exe).Path
+          Push-Location apps/flutter
+          try {
+            flutter test --no-pub test/host_live_test.dart
+            if ($LASTEXITCODE) { throw '真实 IPC 路径测试失败' }
+          } finally { Pop-Location }
+
+  windows:
+    name: Build Windows installer
+    needs: [metadata, verify]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      SHORT_HASH: ${{ needs.metadata.outputs.short_hash }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: native/windows/go.sum
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Fetch the locked sing-box core
+        shell: pwsh
+        run: ./scripts/fetch-singbox.ps1
+
+      - name: Install Inno Setup-free NSIS toolchain
+        # build-installer.ps1 downloads NSIS into .tools\nsis by itself and verifies
+        # the SHA-256 recorded in the script. Nothing to do here; this step exists so
+        # the log says so, rather than leaving a silent 90-second download inside the
+        # build step.
+        shell: pwsh
+        run: Write-Output 'NSIS 由 scripts/build-installer.ps1 自行获取并校验。'
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # -SkipBuild is NOT used: build-installer.ps1 runs build-windows.ps1 first,
+          # which is what produces data/app.so, the runner and the font subset. Passing
+          # -SkipBuild here would package an empty directory.
+          # The service is the only TUN backend; no elevated helper is built.
+          pwsh -NoProfile -File scripts/build-installer.ps1
+          if ($LASTEXITCODE) { throw "安装包构建失败（退出码 $LASTEXITCODE）" }
+
+      - name: Verify the installer payload
+        shell: pwsh
+        run: |
+          # build-installer.ps1 already does this, but repeating the four checks that
+          # actually failed once in this project costs nothing and makes the CI log
+          # self-contained.
+          $exe = Get-ChildItem build/release -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $exe) { throw '没有产出安装包' }
+
+          $info = $exe.VersionInfo
+          if ($info.ProductVersion -ne $env:VERSION) {
+            throw "显示版本 $($info.ProductVersion) 与 $env:VERSION 不一致"
+          }
+          if ($info.ProductVersion -match '\+') {
+            throw "版本号里带着 build 号：$($info.ProductVersion)"
+          }
+
+          $sevenZip = Join-Path $env:ProgramFiles '7-Zip\7z.exe'
+          if (Test-Path $sevenZip) {
+            $listing = & $sevenZip l $exe.FullName 2>&1 | Out-String
+            foreach ($name in 'clash-halo.exe', 'halo-host.exe', 'halo-tun-service.exe', 'sing-box.exe', 'app.so') {
+              if ($listing -notmatch [regex]::Escape($name)) { throw "安装包里缺少 $name" }
+            }
+            Write-Output '7z 载荷校验通过'
+          } else {
+            Write-Warning 'runner 上没有 7-Zip，跳过载荷列表校验'
+          }
+
+      - name: Stage installer
+        shell: pwsh
+        run: |
+          # Ygdria 的命名是 Ygdria-windows-setup-v<ver>-<hash>.exe。保持一致的产品
+          # 前缀与短哈希，是为了让同一个 release 里几个平台的产物一眼分得清，也为了
+          # 让下载过两个版本的机器能从文件名看出区别。
+          New-Item -ItemType Directory -Force release | Out-Null
+          $installer = Get-ChildItem build/release -Filter '*-setup.exe' | Select-Object -First 1
+          $name = "ClashHalo-windows-setup-v$env:VERSION-$env:SHORT_HASH.exe"
+          Copy-Item -LiteralPath $installer.FullName -Destination "release/$name"
+          Write-Output "staged release/$name"
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: ClashHalo-windows-setup
+          path: release/ClashHalo-windows-setup-*.exe
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v6
+        with:
+          pattern: ClashHalo-*
+          path: release-assets
+          merge-multiple: true
+
+      # draft，不是直接公布：安装包没有签名，而本机实测过签名缺失会让 SmartScreen
+      # 与 UAC 都显示「未知发布者」（docs/发布与签名.md）。先起草、人工确认后再发布。
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" release-assets/* \
+            --title "Clash Halo $TAG_NAME" \
+            --generate-notes \
+            --draft

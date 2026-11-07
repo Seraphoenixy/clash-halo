@@ -1,0 +1,8 @@
+{
+  "outbounds": [
+    { "type": "vless", "tag": "缺服务器", "server_port": 443 },
+    { "type": "shadowsocks", "tag": "端口错误", "server": "example.com", "server_port": "x" },
+    { "tag": "缺类型", "server": "example.com", "server_port": 80 },
+    "not-an-object"
+  ]
+}

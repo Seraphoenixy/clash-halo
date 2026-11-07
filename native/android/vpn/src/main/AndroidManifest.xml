@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 侧脚手架（未验证）。
+
+  关键约束来自方案 §5：
+  - VPN Service 运行在独立 :vpn 进程，不初始化 FlutterEngine；
+  - 不导出，只能由本应用绑定；
+  - 前台服务类型必须是 specialUse/… 中真实需要的一种，此处按 VPN 代理声明。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:label="Clash Halo"
+        tools:ignore="MissingApplicationIcon">
+
+        <!--
+          :vpn 独立进程；exported=false 表示只有本应用能绑定。
+          BIND_VPN_SERVICE 由系统在用户授权后持有，本应用自身不声明该权限。
+        -->
+        <service
+            android:name=".vpn.HaloVpnService"
+            android:process=":vpn"
+            android:exported="false"
+            android:permission="android.permission.BIND_VPN_SERVICE"
+            android:foregroundServiceType="specialUse">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="vpn_proxy" />
+        </service>
+    </application>
+</manifest>

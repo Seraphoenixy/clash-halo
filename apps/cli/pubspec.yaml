@@ -1,0 +1,19 @@
+name: halo_cli
+description: "clash-halo 命令行：订阅与节点导入，不经过界面。"
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.0
+
+resolution: workspace
+
+dependencies:
+  halo_domain:
+    path: ../../packages/domain
+  halo_storage:
+    path: ../../packages/storage
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.25.0

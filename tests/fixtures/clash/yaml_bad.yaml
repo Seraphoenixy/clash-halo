@@ -1,0 +1,17 @@
+proxies:
+  - name: 缺端口
+    type: ss
+    server: example.com
+    cipher: aes-256-gcm
+  - name: 端口类型错误
+    type: ss
+    server: example.com
+    port: "not-a-number"
+    cipher: aes-256-gcm
+    password: placeholder
+  - name: 未知协议
+    type: made-up-protocol
+    server: example.com
+    port: 1234
+  - port: 443
+    type: vless

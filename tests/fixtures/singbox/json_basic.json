@@ -1,0 +1,21 @@
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "香港-01",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "11111111-2222-3333-4444-555555555555",
+      "tls": { "enabled": true, "server_name": "example.com" }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "新加坡-02",
+      "server": "example.com",
+      "server_port": 8388,
+      "method": "aes-256-gcm",
+      "password": "placeholder"
+    },
+    { "type": "direct", "tag": "直连" }
+  ]
+}

@@ -1,0 +1,26 @@
+name: clash_halo_workspace
+publish_to: none
+private: true
+
+environment:
+  sdk: ^3.10.0
+
+workspace:
+  - apps/cli
+  - apps/flutter
+  - packages/contracts
+  - packages/domain
+  - packages/config
+  - packages/storage
+
+# The system winsqlite3.dll is present on supported Windows versions. Build
+# hooks load it instead of downloading and shipping a second SQLite. This is
+# read by hooks run from the workspace root, which is the root package for
+# `dart test` and `flutter test` in the member packages.
+hooks:
+  user_defines:
+    sqlite3:
+      source: system
+      name:
+        windows: winsqlite3
+        default: sqlite3

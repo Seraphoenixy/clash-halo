@@ -1,0 +1,38 @@
+<svg width="300" height="300" viewBox="0 0 300 300" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!--
+    Clash Halo 单色猫头，用于托盘、任务栏等只能容纳单色的场景。
+
+    与 halo-cat.svg 的差别只有一处：去掉圆底与青色 halo 环，只留白色剪影，
+    背景由宿主负责（托盘图标通常叠在系统任务栏上）。
+    需要浅色底时，把 fill 改成 #1B1B1B 即可，形状不变。
+  -->
+  <path d="M150 36
+           C181 36 208 45 227 63
+           L246 31
+           C249 26 256 27 256 33
+           L256 95
+           C261 112 263 128 263 145
+           C263 200 213 239 150 239
+           C87 239 37 200 37 145
+           C37 128 39 112 44 95
+           L44 33
+           C44 27 51 26 54 31
+           L73 63
+           C92 45 119 36 150 36 Z"
+        fill="#FFFFFF"/>
+
+  <ellipse cx="108" cy="136" rx="17" ry="22" fill="#1B1B1B"/>
+  <ellipse cx="192" cy="136" rx="17" ry="22" fill="#1B1B1B"/>
+
+  <path d="M150 163 L139 154 C136 151 138 145 143 145 L157 145 C162 145 164 151 161 154 Z"
+        fill="#1B1B1B"/>
+  <path d="M150 165 C150 176 140 182 130 177"
+        stroke="#1B1B1B" stroke-width="7" stroke-linecap="round"/>
+  <path d="M150 165 C150 176 160 182 170 177"
+        stroke="#1B1B1B" stroke-width="7" stroke-linecap="round"/>
+
+  <path d="M84 143 L113 147" stroke="#1B1B1B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M84 163 L113 159" stroke="#1B1B1B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M216 143 L187 147" stroke="#1B1B1B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M216 163 L187 159" stroke="#1B1B1B" stroke-width="6" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,20 @@
+proxies:
+  - name: 香港-01
+    type: ss
+    server: example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: placeholder
+  - name: 日本-02
+    type: vmess
+    server: example.com
+    port: 443
+    uuid: 11111111-2222-3333-4444-555555555555
+    alterId: 0
+    cipher: auto
+    tls: true
+    network: ws
+    ws-opts:
+      path: /ws
+  - name: 直连
+    type: direct

@@ -1,0 +1,5 @@
+{
+  "log": { "level": "warn" },
+  "inbounds": [{ "type": "mixed", "tag": "local-test", "listen": "127.0.0.1", "listen_port": 17893 }],
+  "outbounds": [{ "type": "direct", "tag": "direct" }]
+}

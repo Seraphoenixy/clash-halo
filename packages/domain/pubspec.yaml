@@ -1,0 +1,25 @@
+name: halo_domain
+description: Node, subscription and batch-operation business rules for clash-halo.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.0
+
+resolution: workspace
+
+dependencies:
+  halo_contracts:
+    path: ../contracts
+  yaml: ^3.1.0
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^6.0.0
+  # test/v2rayn_import_test.dart builds real sing-box documents to prove the
+  # importer produces something the generator accepts. It imports halo_config
+  # directly, so the dependency has to be declared: an undeclared import works
+  # only because the two packages happen to sit in the same workspace, and the
+  # analyzer flags it.
+  halo_config:
+    path: ../config

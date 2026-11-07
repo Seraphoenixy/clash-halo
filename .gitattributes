@@ -1,0 +1,45 @@
+# Line endings, declared rather than inferred.
+#
+# core.autocrlf=true was converting on the way in and back on the way out, so
+# every checkout produced "LF will be replaced by CRLF" warnings and left the
+# working tree byte-different from what was stored. Git had to guess per file;
+# a checkout on Linux would have flipped the scripts the other way.
+#
+# The rule below is the one the toolchains actually want:
+#   * text formats are stored and checked out as LF — the Go and Dart toolchains
+#     are happiest with it, and it keeps diffs free of whole-file churn
+#   * Windows scripts keep CRLF, because PowerShell and cmd parse LF-only
+#     .ps1/.cmd files badly enough to produce confusing errors
+#
+# With these rules set, the warnings stop and a fresh clone on any platform
+# produces the same bytes.
+
+* text=auto eol=lf
+
+# PowerShell and batch scripts are the one deliberate exception.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.gif binary
+
+# Test certificates for the CONNECT-proxy test. PEM is text, but `eol=lf`
+# rewriting it makes OpenSSL's parser complain about the base64 body, and a
+# fixture that fails to load turns the proxy test into a false pass.
+*.pem binary
+*.webp binary
+*.dll binary
+*.exe binary
+*.so binary
+*.dat binary
+*.db binary
+*.dylib binary
+*.pdb binary
+*.zip binary
+*.gz binary

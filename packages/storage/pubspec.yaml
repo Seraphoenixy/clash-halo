@@ -1,0 +1,22 @@
+name: halo_storage
+description: Versioned local storage, migrations and backup exchange for clash-halo.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.0
+
+resolution: workspace
+
+dependencies:
+  cryptography: ^2.9.0
+  ffi: ^2.1.0
+  halo_contracts:
+    path: ../contracts
+  halo_domain:
+    path: ../domain
+  sqlite3: ^3.9.0
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^6.0.0

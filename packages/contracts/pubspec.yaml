@@ -1,0 +1,13 @@
+name: halo_contracts
+description: Versioned IPC contract, shared models and error codes for clash-halo.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.0
+
+resolution: workspace
+
+dev_dependencies:
+  test: ^1.25.0
+  lints: ^6.0.0
