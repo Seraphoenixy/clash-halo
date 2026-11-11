@@ -218,6 +218,28 @@ try {
     $stagedAssetsOut = Join-Path $OutDir 'data\flutter_assets'
     if (Test-Path $stagedAssetsOut) { Remove-Item $stagedAssetsOut -Recurse -Force }
     Copy-Item 'build\windows\x64\runner\Release\*' $OutDir -Recurse -Force
+
+    # Two files the CMake install step used to produce and everything downstream
+    # treats as mandatory (build-installer.ps1's precheck and the NSIS File
+    # directives). On the cl/link path nothing creates them, and a machine that
+    # never ran CMake has no leftovers either — so supply them here, for both
+    # branches (no-op when the full build already put them in place).
+    if (-not (Test-Path (Join-Path $OutDir 'flutter_windows.dll'))) {
+        # clash-halo.exe links against the engine import library; without this
+        # DLL next to it the staged app fails to load at all (0xc0000135).
+        $engineDll = Join-Path $flutterCache 'artifacts\engine\windows-x64\flutter_windows.dll'
+        if (-not (Test-Path $engineDll)) {
+            throw "引擎缓存里没有 flutter_windows.dll（$engineDll）：界面外壳无法启动，先运行 flutter precache 或重装修 Flutter SDK。"
+        }
+        Copy-Item $engineDll (Join-Path $OutDir 'flutter_windows.dll') -Force
+    }
+    if (-not (Test-Path (Join-Path $OutDir 'native_assets.json'))) {
+        # A legacy CMake run left an empty manifest here and the installer payload
+        # still ships it. The live lookup path is data\flutter_assets\
+        # NativeAssetsManifest.json (deployed with the assets above), so an empty
+        # file is exactly what the old flow left behind — nothing more.
+        New-Item -ItemType File (Join-Path $OutDir 'native_assets.json') | Out-Null
+    }
 } finally { Pop-Location }
 
 $core = Join-Path $root 'prototype\bin\sing-box.exe'
@@ -234,7 +256,10 @@ Copy-Item $core (Join-Path $OutDir 'sing-box.exe') -Force
 # companion files from here, so a build that omits it makes TUN install fail. A
 # missing file is a build failure rather than a warning — the resulting packages
 # would install fine and then break on the first TUN enable.
-$cronet = Join-Path $root (Join-Path 'prototype' (Join-Path 'runtime' (Join-Path 'core' 'sing-box-1.14.4-windows-amd64\libcronet.dll')))
+# fetch-singbox.ps1 stages both the core and this DLL into prototype\bin (its
+# own contract: "the verified binaries the build and tests look for"); look
+# there, not at the removed runtime\core extract.
+$cronet = Join-Path $root (Join-Path 'prototype' (Join-Path 'bin' 'libcronet.dll'))
 if (!(Test-Path $cronet)) {
     throw "libcronet.dll missing at $cronet; Naive nodes and the TUN service both need it"
 }
@@ -352,5 +377,11 @@ if ($Sign -or $SelfSigned -or $PfxPath -or $Thumbprint) {
     if ($Thumbprint) { $signArgs.Thumbprint = $Thumbprint }
     & (Join-Path $PSScriptRoot 'sign-windows.ps1') @signArgs
 }
+
+# The application ships GPL-3.0-or-later; keep the license next to the binaries
+# so a copied or installed directory is self-describing.
+$license = Join-Path $root 'LICENSE'
+if (-not (Test-Path -LiteralPath $license)) { throw "缺少 LICENSE 文件：$license" }
+Copy-Item -LiteralPath $license -Destination (Join-Path $OutDir 'LICENSE') -Force
 
 Write-Output "Staged Windows application: $OutDir"

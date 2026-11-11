@@ -10,13 +10,16 @@ import 'package:halo_contracts/halo_contracts.dart';
 import 'package:halo_domain/halo_domain.dart';
 import 'package:halo_storage/halo_storage.dart';
 
+import '../ipc/android_vpn.dart';
 import '../ipc/halo_client.dart';
 import 'catalog_store.dart';
 import 'host_connection.dart';
 import 'routing_settings.dart';
 import 'runtime_store.dart';
+import 'session_state.dart';
 import 'speed_batch_tracker.dart';
 import 'subscription_manager.dart';
+import 'throughput.dart';
 import 'tray_coordinator.dart';
 import 'unlock.dart';
 import 'unlock_controller.dart';
@@ -24,6 +27,19 @@ import 'unlock_controller.dart';
 // SubscriptionUpdate is part of the controller's public result shape; tests
 // and pages import it from here. The implementation moved to its own library.
 export 'subscription_manager.dart' show SubscriptionUpdate;
+
+// Android 侧没有 halo-host：代理内核（libbox）运行在 :vpn 进程的
+// HaloVpnService 里，启停与配置经平台通道驱动。见 lib/src/ipc/android_vpn.dart。
+final AndroidVpnClient _androidVpn = const AndroidVpnClient();
+
+/// Android 上激活节点 id 的持久化键。Windows 上该状态由宿主快照持有，
+/// Android 没有宿主，改由数据库的 settings 表持有。
+const String _kAndroidActiveNode = 'android.activeNodeId';
+
+/// Android 本地测速使用的目标地址，与 Windows 探测的默认值一致。
+const String _kAndroidProbeUrl = 'https://www.gstatic.com/generate_204';
+const String _kAndroidSpeedUrl =
+    'https://speed.cloudflare.com/__down?bytes=5000000';
 
 /// Owns every piece of state the UI renders.
 ///
@@ -233,6 +249,24 @@ class AppController {
   final ValueNotifier<int> connectionRevision = ValueNotifier<int>(0);
   final ValueNotifier<int> errorRevision = ValueNotifier<int>(0);
 
+  /// Session throughput. Owned by the controller, not the overview page, so
+  /// leaving the page does not reset the samples or the peak counters.
+  final ThroughputMonitor _throughput = ThroughputMonitor(
+    historyLength: 40,
+    proxyOnly: true,
+  );
+  final ValueNotifier<int> trafficRevision = ValueNotifier<int>(0);
+
+  /// Bumped after the host session is re-read. Node results live in the host,
+  /// so a window that reconnects replaces its local view from this signal
+  /// rather than keeping whatever it had before the pipe dropped.
+  final ValueNotifier<int> sessionRevision = ValueNotifier<int>(0);
+  Timer? _trafficTimer;
+  bool _trafficPolling = false;
+  (int, int)? _trafficCore;
+  String? _trafficError;
+  bool _snapshotInjectedForTest = false;
+
   final StreamController<LogEntry> _logLines =
       StreamController<LogEntry>.broadcast();
 
@@ -258,6 +292,7 @@ class AppController {
   /// The batch whose results are currently wanted. See [SpeedBatchTracker];
   /// the tracker drops stragglers from a superseded batch.
   HaloStore? _store;
+
   /// Repositories and their read caches; bound when the database opens.
   late final CatalogStore catalog = CatalogStore();
   SettingsRepository? _settings;
@@ -268,6 +303,16 @@ class AppController {
 
   StreamSubscription<HaloEventMessage>? _streamSub;
   bool _disposed = false;
+
+  /// Android `:vpn` 进程的最近一次状态；Windows 上恒为 null。
+  AndroidVpnStatus? _androidVpnStatus;
+  Timer? _androidStatusTimer;
+  bool _androidStatusPolling = false;
+
+  /// Android 本地测速：串行切换 `:vpn` 配置，逐节点探测。
+  bool _androidSpeedCanceled = false;
+  String? _androidSpeedTaskId;
+  Future<void>? _androidSpeedRun;
 
   /// Guards the launch auto-start against rapid reconnects.
   bool _autoCoreStartInFlight = false;
@@ -343,6 +388,47 @@ class AppController {
 
   bool get connected => host.connected;
 
+  /// UI 上「节点/内核操作」是否可用。
+  ///
+  /// Windows 以宿主管道连接为准；Android 没有宿主——操作经平台通道直接驱动
+  /// `:vpn` 服务，数据库打开即可（测延迟等确实依赖宿主的能力仍单独挂 [connected]，
+  /// 在 Android 上如实保持禁用）。
+  bool get canOperate => Platform.isAndroid ? storeReady : connected;
+
+  /// 当前是否运行在 Android 上。
+  ///
+  /// UI 用它选择 Android 的 VPN 状态来源，而不是把 `Platform.isAndroid`
+  /// 分散到各个页面。
+  bool get isAndroid => Platform.isAndroid;
+
+  /// `:vpn` 进程的最近一次状态；未读取到时为 null。
+  AndroidVpnStatus? get androidVpnStatus => _androidVpnStatus;
+
+  bool get androidVpnActive => _androidVpnStatus?.isActive ?? false;
+
+  bool get androidVpnStarted => _androidVpnStatus?.isStarted ?? false;
+
+  /// Whether a local Android speed batch is still running (including the
+  /// restore step). The node page must not offer a new batch while the previous
+  /// one is switching the VPN back.
+  bool get androidSpeedTestRunning => _androidSpeedRun != null;
+
+  /// 把 `:vpn` 状态映射到宿主模型的内核状态，供状态栏与徽标复用同一套
+  /// 文案和颜色，不新增第二套状态枚举。
+  CoreState get androidCoreState => switch (_androidVpnStatus?.state) {
+    'Started' => CoreState.running,
+    'Starting' => CoreState.starting,
+    'Failed' => CoreState.failed,
+    _ => CoreState.stopped,
+  };
+
+  String get androidVpnLabel => switch (_androidVpnStatus?.state) {
+    'Started' => '已连接',
+    'Starting' => '连接中',
+    'Failed' => '启动失败',
+    _ => '未连接',
+  };
+
   /// The version string the host read out of the core binary on disk.
   ///
   /// Empty means the host did not report one — it never probed the binary, or
@@ -385,7 +471,29 @@ class AppController {
       speed.reachabilityOf(nodeId, metric);
 
   /// Drops every measurement for one node (used when it is deleted).
-  void forgetSpeedResult(String nodeId) => speed.forgetNode(nodeId);
+  void forgetSpeedResult(String nodeId) {
+    speed.forgetNode(nodeId);
+    // The host keeps its own copy; without this, deleting a node and later
+    // reviving the same id would bring the old reading back on the next reopen.
+    if (!Platform.isWindows || !connected) return;
+    unawaited(() async {
+      try {
+        await client.send(
+          HaloAction.speedTestForget,
+          params: {'nodeId': nodeId},
+          timeout: const Duration(seconds: 5),
+        );
+      } on Object {
+        // Cleanup is best-effort; the stale row is filtered by node existence.
+      }
+    }());
+  }
+
+  /// Live session throughput; retained across page navigation for the life of
+  /// this UI process.
+  ThroughputMonitor get throughput => _throughput;
+
+  String? get trafficError => _trafficError;
 
   /// Opens the database and connects to the host.
   ///
@@ -394,7 +502,8 @@ class AppController {
   Future<void> start({bool connectHost = true}) async {
     _openStore();
     if (!storeReady) {
-      _lastActionError = '数据目录不可写或数据库不可用：$dataDir。请检查当前用户的目录权限；便携版可在程序目录创建 portable.flag，数据将保存在 user-data。';
+      _lastActionError =
+          '数据目录不可写或数据库不可用：$dataDir。请检查当前用户的目录权限；便携版可在程序目录创建 portable.flag，数据将保存在 user-data。';
       errorChanged();
       return;
     }
@@ -412,11 +521,51 @@ class AppController {
       }
     }
     subscriptions.startTimer();
+    if (Platform.isAndroid) {
+      // Android 没有 halo-host。启动宿主连接只会每 2 秒尝试加载
+      // kernel32.dll 并失败，状态改由 :vpn 的状态文件提供。
+      _startAndroidStatusPolling();
+      return;
+    }
     if (!connectHost) return;
     _streamSub = client.events.listen(_onEvent);
     await host.start();
     if (connected) await refreshSnapshot();
     connectionChanged();
+  }
+
+  void _startAndroidStatusPolling() {
+    _androidStatusTimer?.cancel();
+    unawaited(refreshAndroidVpnStatus());
+    _androidStatusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      unawaited(refreshAndroidVpnStatus());
+    });
+  }
+
+  /// 重新读取 `:vpn` 状态；状态变化时才通知界面重组。
+  Future<void> refreshAndroidVpnStatus() async {
+    if (!Platform.isAndroid || _disposed || _androidStatusPolling) return;
+    _androidStatusPolling = true;
+    try {
+      final next = await _androidVpn.status();
+      _applyAndroidVpnStatus(next);
+    } on Object {
+      // 通道暂时不可用（例如服务正在被杀）：保持上一次可读状态，
+      // 下一次轮询会自然恢复；不要把界面重置成连接失败。
+    } finally {
+      _androidStatusPolling = false;
+    }
+  }
+
+  void _applyAndroidVpnStatus(AndroidVpnStatus next) {
+    final previous = _androidVpnStatus;
+    _androidVpnStatus = next;
+    if (previous == null ||
+        previous.state != next.state ||
+        previous.message != next.message ||
+        previous.updatedAt != next.updatedAt) {
+      runtimeChanged();
+    }
   }
 
   void _openStore() {
@@ -440,18 +589,35 @@ class AppController {
   /// state, and a production path that called this would fight it.
   @visibleForTesting
   void applySnapshotForTest(RuntimeSnapshot snapshot, {bool? connected}) {
-    adoptSnapshot(snapshot);
-    // The guidance rules short-circuit on connection state, so a test that
-    // wants to exercise the snapshot-driven rules has to be able to say "the
-    // pipe is up" without standing up a real host.
-    if (connected != null) {
-      host.setStateForTest(
-        connected
-            ? HostConnectionState.connected
-            : HostConnectionState.disconnected,
-      );
+    _snapshotInjectedForTest = true;
+    try {
+      adoptSnapshot(snapshot);
+      // The guidance rules short-circuit on connection state, so a test that
+      // wants to exercise the snapshot-driven rules has to be able to say "the
+      // pipe is up" without standing up a real host.
+      if (connected != null) {
+        host.setStateForTest(
+          connected
+              ? HostConnectionState.connected
+              : HostConnectionState.disconnected,
+        );
+      }
+      // Widget tests end before the controller's dispose, so starting the
+      // periodic session timer here would leave a pending timer. Sample once
+      // instead; production starts the timer from adoptSnapshot.
+      if (connected == true) _pollTrafficOnceForTest();
+    } finally {
+      _snapshotInjectedForTest = false;
     }
     runtimeChanged();
+  }
+
+  void _pollTrafficOnceForTest() {
+    if (!Platform.isWindows) return;
+    final snap = runtime.snapshot;
+    if (snap == null || !snap.coreState.isRunning) return;
+    _trafficCore = (snap.corePid, snap.tunPid);
+    unawaited(_pollTraffic());
   }
 
   /// Publishes a connection state as if the client had reported it.
@@ -468,7 +634,12 @@ class AppController {
   ///
   /// Returns true for every other change, including the first snapshot. The
   /// proxy-only decision and its narrow channel live in [RuntimeStore].
-  bool adoptSnapshot(RuntimeSnapshot snapshot) => runtime.adopt(snapshot);
+  bool adoptSnapshot(RuntimeSnapshot snapshot) {
+    final changed = runtime.adopt(snapshot);
+    // A core start/stop changes whether throughput can be sampled at all.
+    _syncTrafficPolling();
+    return changed;
+  }
 
   /// Retries immediately instead of waiting for the next scheduled attempt.
   ///
@@ -495,6 +666,10 @@ class AppController {
       // Subscription is best-effort; the snapshot below still works.
     }
     await refreshSnapshot();
+    // The host owns speed results and traffic for its whole lifetime. Read them
+    // after the snapshot so the traffic clock's core identity is already known;
+    // this is what a freshly opened window shows instead of starting at zero.
+    await _loadSessionState();
     // 启动 clash-halo.exe 应自动启动内核：连接建立后内核仍不在运行，就把它
     // 拉起来（见 [ensureCoreRunningForLaunch]）。
     unawaited(ensureCoreRunningForLaunch());
@@ -510,6 +685,55 @@ class AppController {
     // window was closed.
     unawaited(publishTrayCatalog());
     unawaited(_consumeTrayRequest());
+  }
+
+  /// Reads the host's lifetime session and replaces the local view.
+  ///
+  /// Failure is non-fatal: the window still paints and the normal reconnect
+  /// path will try again. It must not raise the one-line error strip either —
+  /// this is background state, not an action the user asked for.
+  Future<void> _loadSessionState() async {
+    if (_disposed || !Platform.isWindows || !connected) return;
+    try {
+      final response = await client.send(
+        HaloAction.sessionGet,
+        timeout: const Duration(seconds: 5),
+      );
+      if (!response.ok) return;
+      final session = HaloSessionState.fromJson(_jsonMap(response.result));
+      final speedState = session.speed;
+      speed.hydrateSession(
+        running: speedState.running,
+        taskId: speedState.taskId,
+        metric: speedState.metric,
+        total: speedState.total,
+        pending: speedState.pending,
+        results: speedState.results,
+      );
+      _applyTraffic(session.traffic);
+      sessionRevision.value++;
+      trafficRevision.value++;
+      runtimeChanged();
+    } on Object {
+      // Keep the local view; a reconnect will read the session again.
+    }
+  }
+
+  static Map<String, Object?> _jsonMap(Object? raw) =>
+      raw is Map ? raw.cast<String, Object?>() : const <String, Object?>{};
+
+  void _applyTraffic(TrafficSessionState state) {
+    _throughput.restore(
+      uploadTotal: state.uploadTotal,
+      downloadTotal: state.downloadTotal,
+      upRate: state.upRate,
+      downRate: state.downRate,
+      peakUp: state.peakUp,
+      peakDown: state.peakDown,
+      history: state.history,
+      activeConnections: state.activeConnections,
+    );
+    _trafficError = state.error;
   }
 
   void _onEvent(HaloEventMessage event) {
@@ -717,11 +941,108 @@ class AppController {
   // Core / routing
   // ------------------------------------------------------------------
 
-  Future<void> startCore() => _command(HaloAction.coreStart);
+  Future<void> startCore() async {
+    if (Platform.isAndroid) {
+      await _startAndroidVpn();
+      return;
+    }
+    await _command(HaloAction.coreStart);
+  }
 
-  Future<void> stopCore() => _command(HaloAction.coreStop);
+  Future<void> stopCore() async {
+    if (Platform.isAndroid) {
+      final status = await _androidVpn.stopAndWait();
+      _applyAndroidVpnStatus(status);
+      return;
+    }
+    await _command(HaloAction.coreStop);
+  }
 
-  Future<void> restartCore() => _command(HaloAction.coreRestart);
+  Future<void> restartCore() async {
+    if (Platform.isAndroid) {
+      await startCore();
+      return;
+    }
+    await _command(HaloAction.coreRestart);
+  }
+
+  /// Android：为激活节点构建带 TUN inbound 的文档，交给 `:vpn` 服务启动。
+  ///
+  /// Windows 上 TUN 由宿主注入自己的 inbound；Android 没有宿主，TUN 的提供方
+  /// 就是 VpnService 本身，所以文档直接携带 tun inbound。
+  Future<void> _startAndroidVpn() async {
+    try {
+      if (!storeReady) throw StateError('数据库不可用');
+      final id = _activeNodeId;
+      final node = id == null ? null : nodeRepo.nodeById(id);
+      if (node == null) {
+        throw StateError('还没有启用的节点：请先在节点页启用一个节点');
+      }
+      final built = routing.build(node, withTun: true);
+      if (!built.ok) {
+        throw StateError(built.issues.map((i) => i.message).join('；'));
+      }
+      if (!await _androidVpn.permissionGranted()) {
+        final granted = await _androidVpn.requestPermission();
+        if (!granted) throw StateError('未授予 VPN 权限');
+      }
+      final status = await _androidVpn.startAndWait(
+        built.config!.toJsonString(),
+      );
+      _applyAndroidVpnStatus(status);
+      _lastActionError = null;
+      errorChanged();
+    } on Object catch (error) {
+      _lastActionError = '$error';
+      errorChanged();
+      rethrow;
+    }
+  }
+
+  /// 状态栏「刷新/重试」在 Android 上的入口：先读真实状态，只有确实
+  /// 未运行或失败时才重新启动。
+  Future<void> retryAndroidVpn() async {
+    await refreshAndroidVpnStatus();
+    final status = _androidVpnStatus;
+    if (status != null && status.isActive) return;
+    try {
+      await startCore();
+    } on Object catch (error) {
+      _lastActionError = '$error';
+      errorChanged();
+      rethrow;
+    }
+  }
+
+  /// 激活节点 id。Windows 读宿主快照（宿主是运行时状态的权威）；
+  /// Android 没有宿主，由数据库 settings 表持有。
+  String? get _activeNodeId {
+    if (Platform.isAndroid) {
+      if (!storeReady) return null;
+      final value = settingsRepo.raw(_kAndroidActiveNode) ?? '';
+      return value.isEmpty ? null : value;
+    }
+    final id = runtime.snapshot?.activeNodeId;
+    return (id == null || id.isEmpty) ? null : id;
+  }
+
+  /// 当前激活节点；UI 统一从这里取值，不再直接读宿主快照。
+  String? get activeNodeId => _activeNodeId;
+
+  /// 当前激活节点的显示名。Windows 优先用宿主快照里的名称（节点行可能
+  /// 已被删除但宿主仍在运行）；Android 从本地节点表读取。
+  String? get activeNodeName {
+    if (Platform.isAndroid) {
+      final id = _activeNodeId;
+      if (id == null || !storeReady) return null;
+      return nodeRepo.nodeById(id)?.name;
+    }
+    final fromSnapshot = runtime.snapshot?.activeNodeName;
+    if (fromSnapshot != null && fromSnapshot.isNotEmpty) return fromSnapshot;
+    final id = _activeNodeId;
+    if (id == null || !storeReady) return null;
+    return nodeRepo.nodeById(id)?.name;
+  }
 
   Future<void> setMode(ProxyMode mode) async {
     // Persist first: the routing mode is part of the generated document, not
@@ -733,6 +1054,12 @@ class AppController {
     final routeMode = RouteMode.fromWire(wire);
     if (storeReady) {
       current.copyWith(mode: routeMode).save(settingsRepo);
+    }
+    if (Platform.isAndroid) {
+      // 没有宿主可通知；配置会经 reapply 重新生成并交给 :vpn 服务。
+      await reapplyRoutingIfPossible();
+      runtimeChanged();
+      return;
     }
     // Tell the host as well so its snapshot (and the tray menu, which renders
     // from it) shows the new mode immediately, even when no node is applied.
@@ -762,11 +1089,18 @@ class AppController {
   /// when no node is active or the host is disconnected: the settings are still
   /// saved, and the next node selection will use them.
   Future<bool> reapplyRoutingIfPossible() async {
-    if (!storeReady || !connected) return false;
-    final activeId = runtime.snapshot?.activeNodeId;
+    if (!storeReady) return false;
+    if (!connected && !Platform.isAndroid) return false;
+    final activeId = _activeNodeId;
     if (activeId == null || activeId.isEmpty) return false;
     final node = nodeRepo.nodeById(activeId);
     if (node == null) return false;
+    if (Platform.isAndroid) {
+      // 统一走 _startAndroidVpn：它包含权限检查、启动回执与状态刷新，
+      // 避免这里成为绕过授权检查的第二条启动路径。
+      await _startAndroidVpn();
+      return true;
+    }
     final built = routing.build(node);
     if (!built.ok) {
       throw StateError(built.issues.map((i) => i.message).join('；'));
@@ -782,7 +1116,7 @@ class AppController {
   /// the node being proxied came from it. Caching it would create a second
   /// source of truth that the next node switch could silently contradict.
   String? get _activeProfileId {
-    final activeId = runtime.snapshot?.activeNodeId;
+    final activeId = _activeNodeId;
     if (activeId == null || activeId.isEmpty) return null;
     return nodeRepo.nodeById(activeId)?.profileId;
   }
@@ -802,7 +1136,7 @@ class AppController {
     if (candidates.isEmpty) {
       throw StateError('订阅「${profile.name}」还没有节点，请先更新该订阅');
     }
-    final activeId = runtime.snapshot?.activeNodeId;
+    final activeId = _activeNodeId;
     final keep = candidates.where((n) => n.id == activeId).firstOrNull;
     await selectNode((keep ?? candidates.first).id);
   }
@@ -841,12 +1175,28 @@ class AppController {
       // Built from the persisted routing settings, not from defaults: the old
       // path always used RouteMode.rule and port 7890, so switching a node
       // silently discarded the user's DNS and routing choices.
-      final built = routing.build(node);
+      final built = routing.build(node, withTun: Platform.isAndroid);
       if (!built.ok) {
         throw StateError(built.issues.map((i) => i.message).join('；'));
       }
       config = built.config!.toJsonString();
       nodeName ??= node.name;
+      if (Platform.isAndroid) {
+        // Windows 由宿主在 nodeSelect 里持久化激活节点并应用配置；
+        // Android 存在本地 settings，配置直接交给 :vpn 服务。
+        if (!storeReady) throw StateError('数据库不可用');
+        if (!await _androidVpn.permissionGranted()) {
+          final granted = await _androidVpn.requestPermission();
+          if (!granted) throw StateError('未授予 VPN 权限');
+        }
+        // 先等内核进入 Started 再记录激活节点：启动失败时界面不能把
+        // 一个没有运行的节点标成“使用中”。
+        final status = await _androidVpn.startAndWait(config);
+        settingsRepo.setRaw(_kAndroidActiveNode, nodeId);
+        _applyAndroidVpnStatus(status);
+        catalogChanged();
+        return;
+      }
       _publishTrayCatalog();
     }
     await _command(
@@ -886,20 +1236,16 @@ class AppController {
   ///
   /// The host owns the registry write: only it knows the absolute path of the
   /// binary Windows should start.
-  Future<void> setAutoLaunch(bool enabled) => _command(
-    HaloAction.autoLaunchSet,
-    params: {'enabled': enabled},
-  );
+  Future<void> setAutoLaunch(bool enabled) =>
+      _command(HaloAction.autoLaunchSet, params: {'enabled': enabled});
 
   /// Chooses whether the next launch starts the core again.
   ///
   /// Separate from [startCore] and [stopCore] on purpose: this changes what
   /// happens *later*, it does not touch the process running right now. Turning
   /// it off while the proxy is up must not silently kill the user's traffic.
-  Future<void> setCoreResume(bool enabled) => _command(
-    HaloAction.coreResumeSet,
-    params: {'enabled': enabled},
-  );
+  Future<void> setCoreResume(bool enabled) =>
+      _command(HaloAction.coreResumeSet, params: {'enabled': enabled});
 
   /// Enables or disables TUN.
   ///
@@ -976,10 +1322,8 @@ class AppController {
   }
 
   /// Closes one connection through the core's controller.
-  Future<void> closeConnection(String id) => _command(
-    HaloAction.connectionsClose,
-    params: {'id': id},
-  );
+  Future<void> closeConnection(String id) =>
+      _command(HaloAction.connectionsClose, params: {'id': id});
 
   /// Closes every connection.
   Future<void> closeAllConnections() =>
@@ -996,28 +1340,411 @@ class AppController {
   Future<String> startSpeedTest({
     List<String> nodeIds = const [],
     List<String> endpoints = const [],
+
     /// Which quantity to measure. Latency and throughput are separate runs.
     SpeedMetric metric = SpeedMetric.proxyLatency,
     String url = '',
+
     /// Left at 0 so the host can apply the budget the metric needs.
     int timeoutMs = 0,
+
     /// Zero uses the stored preference; downloads default to serial.
     int concurrency = 0,
-  }) => speed.start(
-    nodeIds: nodeIds,
-    endpoints: endpoints,
-    metric: metric,
-    url: url,
-    timeoutMs: timeoutMs,
-    concurrency: concurrency,
-  );
+  }) {
+    if (Platform.isAndroid) {
+      return _startAndroidSpeedTest(
+        nodeIds: nodeIds,
+        metric: metric,
+        url: url,
+        timeoutMs: timeoutMs,
+        concurrency: concurrency,
+      );
+    }
+    return speed.start(
+      nodeIds: nodeIds,
+      endpoints: endpoints,
+      metric: metric,
+      url: url,
+      timeoutMs: timeoutMs,
+      concurrency: concurrency,
+    );
+  }
 
   /// Bounds a concurrency value to what the host accepts. Kept on the
   /// controller because the settings page and its tests call it here.
   static int clampConcurrency(int value) =>
       SpeedBatchTracker.clampConcurrency(value);
 
-  Future<void> cancelTask(String taskId) => speed.cancel(taskId);
+  Future<void> cancelTask(String taskId) async {
+    if (Platform.isAndroid) {
+      if (_androidSpeedTaskId != taskId) return;
+      _androidSpeedCanceled = true;
+      await _androidSpeedRun;
+      return;
+    }
+    await speed.cancel(taskId);
+  }
+
+  /// Android 本地测速入口。
+  ///
+  /// 没有宿主来启动一次性探测内核，所以这里串行地让 `:vpn` 服务载入每个
+  /// 节点的配置，测完再恢复原来的节点。测速期间 VPN 会短暂切换；这是当前
+  /// 单服务架构的边界，不是测速结果本身的一部分。
+  Future<String> _startAndroidSpeedTest({
+    required List<String> nodeIds,
+    required SpeedMetric metric,
+    required String url,
+    required int timeoutMs,
+    required int concurrency,
+  }) async {
+    if (!storeReady) throw StateError('数据库不可用');
+    if (_androidSpeedRun != null) throw StateError('已有测速任务在运行');
+    final requested = nodeIds.toSet();
+    final selected = loadNodes()
+        .where((n) => requested.isEmpty || requested.contains(n.id))
+        .toList();
+    if (selected.isEmpty) throw StateError('没有可测速的节点');
+    final taskId = speed.beginLocalBatch(
+      selected: selected,
+      metric: metric,
+      allNodes: nodeIds.isEmpty,
+    );
+    _androidSpeedTaskId = taskId;
+    _androidSpeedCanceled = false;
+    final run = _runAndroidSpeedTest(
+      nodes: selected,
+      metric: metric,
+      url: url,
+      timeoutMs: timeoutMs,
+    );
+    _androidSpeedRun = run;
+    unawaited(run);
+    return taskId;
+  }
+
+  Future<void> _runAndroidSpeedTest({
+    required List<ProxyNode> nodes,
+    required SpeedMetric metric,
+    required String url,
+    required int timeoutMs,
+  }) async {
+    await refreshAndroidVpnStatus();
+    final wasRunning = androidVpnStarted;
+    final previousNodeId = activeNodeId;
+    final previousNode = previousNodeId == null
+        ? null
+        : nodeRepo.nodeById(previousNodeId);
+    String? previousConfig;
+    if (previousNode != null) {
+      final built = routing.build(previousNode, withTun: true);
+      if (built.ok) previousConfig = built.config!.toJsonString();
+    }
+    final target = url.isNotEmpty
+        ? url
+        : metric == SpeedMetric.download
+        ? _kAndroidSpeedUrl
+        : _kAndroidProbeUrl;
+    final timeout = Duration(
+      milliseconds: timeoutMs > 0
+          ? timeoutMs
+          : (metric == SpeedMetric.download ? 30000 : 8000),
+    );
+    try {
+      if (metric != SpeedMetric.tcp && !await _androidVpn.permissionGranted()) {
+        final granted = await _androidVpn.requestPermission();
+        if (!granted) {
+          for (final node in nodes) {
+            speed.recordLocalResult(
+              _androidFailure(node, metric, 'vpn_permission', '未授予 VPN 权限'),
+            );
+          }
+          return;
+        }
+      }
+      if (metric == SpeedMetric.tcp && androidVpnStarted) {
+        // A raw TCP connect from the UI process would otherwise be captured by
+        // the active tunnel and measure the active node, not the node row.
+        final status = await _androidVpn.stopAndWait();
+        _applyAndroidVpnStatus(status);
+        // The status file flips to Stopped before the service closes tun0;
+        // give the TUN teardown a moment so the direct sockets are not still
+        // captured by the old interface.
+        await Future<void>.delayed(const Duration(milliseconds: 600));
+      }
+      for (final node in nodes) {
+        if (_androidSpeedCanceled) {
+          speed.recordLocalResult(_androidCanceled(node, metric));
+          continue;
+        }
+        SpeedResult result;
+        try {
+          result = await _probeAndroidNode(node, metric, target, timeout);
+        } on Object catch (error) {
+          result = _androidFailure(
+            node,
+            metric,
+            'probe_failed',
+            error.toString(),
+          );
+        }
+        speed.recordLocalResult(result);
+      }
+    } on Object catch (error) {
+      for (final node in nodes) {
+        if (!speed.pending.contains(node.id)) continue;
+        speed.recordLocalResult(
+          _androidFailure(node, metric, 'probe_failed', error.toString()),
+        );
+      }
+    } finally {
+      for (final id in speed.pending.toList()) {
+        final node = nodes.where((n) => n.id == id).firstOrNull;
+        if (node != null) {
+          speed.recordLocalResult(_androidCanceled(node, metric));
+        }
+      }
+      try {
+        if (wasRunning && previousConfig != null) {
+          final status = await _androidVpn.startAndWait(previousConfig);
+          _applyAndroidVpnStatus(status);
+        } else if (androidVpnStarted) {
+          final status = await _androidVpn.stopAndWait();
+          _applyAndroidVpnStatus(status);
+        }
+      } on Object {
+        // Restore is best-effort; the next status poll reports what the
+        // service actually ended up doing.
+        await refreshAndroidVpnStatus();
+      } finally {
+        speed.finishLocalBatch();
+        _androidSpeedTaskId = null;
+        _androidSpeedCanceled = false;
+        _androidSpeedRun = null;
+        runtimeChanged();
+      }
+    }
+  }
+
+  Future<SpeedResult> _probeAndroidNode(
+    ProxyNode node,
+    SpeedMetric metric,
+    String target,
+    Duration timeout,
+  ) async {
+    switch (metric) {
+      case SpeedMetric.tcp:
+        if (node.isUdpTransport) {
+          return SpeedResult(
+            nodeId: node.id,
+            metric: metric,
+            status: SpeedStatus.notApplicable,
+            errorCode: 'not_applicable',
+            errorMessage: '该节点使用 UDP 传输，不适用 TCP 握手检查',
+          );
+        }
+        return _probeAndroidTcp(node, timeout);
+      case SpeedMetric.udp:
+        if (!node.isUdpTransport) {
+          return SpeedResult(
+            nodeId: node.id,
+            metric: metric,
+            status: SpeedStatus.notApplicable,
+            errorCode: 'not_applicable',
+            errorMessage: '该节点不使用 UDP 传输',
+          );
+        }
+        return _probeAndroidThroughVpnWithRetry(node, metric, target, timeout);
+      case SpeedMetric.proxyLatency:
+      case SpeedMetric.download:
+        return _probeAndroidThroughVpnWithRetry(node, metric, target, timeout);
+    }
+  }
+
+  /// One retry covers the reload race: the status can flip to Started a
+  /// fraction before the mixed inbound is actually accepting requests.
+  Future<SpeedResult> _probeAndroidThroughVpnWithRetry(
+    ProxyNode node,
+    SpeedMetric metric,
+    String target,
+    Duration timeout,
+  ) async {
+    final first = await _probeAndroidThroughVpn(node, metric, target, timeout);
+    if (first.status != SpeedStatus.failed ||
+        first.errorCode == 'http_status' ||
+        _androidSpeedCanceled) {
+      return first;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+    return _probeAndroidThroughVpn(node, metric, target, timeout);
+  }
+
+  Future<SpeedResult> _probeAndroidTcp(ProxyNode node, Duration timeout) async {
+    final watch = Stopwatch()..start();
+    try {
+      final socket = await Socket.connect(
+        node.server,
+        node.port,
+        timeout: timeout,
+      );
+      socket.destroy();
+      return SpeedResult(
+        nodeId: node.id,
+        metric: SpeedMetric.tcp,
+        status: SpeedStatus.ok,
+        valueMs: watch.elapsedMilliseconds,
+      );
+    } on Object catch (error) {
+      return _androidFailure(
+        node,
+        SpeedMetric.tcp,
+        'tcp_failed',
+        error.toString(),
+        valueMs: watch.elapsedMilliseconds,
+      );
+    }
+  }
+
+  Future<SpeedResult> _probeAndroidThroughVpn(
+    ProxyNode node,
+    SpeedMetric metric,
+    String target,
+    Duration timeout,
+  ) async {
+    // Probe configs use 全局 so the test always goes through the node, even
+    // when the user's current routing mode is 直连.
+    final testSettings = routing.copyWith(mode: RouteMode.global);
+    final built = testSettings.build(node, withTun: true);
+    if (!built.ok) {
+      return _androidFailure(
+        node,
+        metric,
+        'config_invalid',
+        built.issues.map((i) => i.message).join('；'),
+      );
+    }
+    try {
+      final status = await _androidVpn.startAndWait(
+        built.config!.toJsonString(),
+      );
+      _applyAndroidVpnStatus(status);
+    } on Object catch (error) {
+      return _androidFailure(node, metric, 'vpn_start', error.toString());
+    }
+    final port = routing.mixedPort;
+    if (!await _waitForLocalPort(port, const Duration(seconds: 5))) {
+      return _androidFailure(node, metric, 'proxy_not_ready', '本地代理入口未就绪');
+    }
+    // The listener can accept before the core has finished wiring its
+    // outbound; a short settle keeps the first request from racing startup.
+    await Future<void>.delayed(const Duration(milliseconds: 250));
+    final client = HttpClient()
+      ..connectionTimeout = timeout
+      ..findProxy = ((_) => 'PROXY 127.0.0.1:$port');
+    final watch = Stopwatch()..start();
+    try {
+      final request = await client.getUrl(Uri.parse(target)).timeout(timeout);
+      request.headers.set(
+        HttpHeaders.userAgentHeader,
+        'clash-halo-speedtest/1',
+      );
+      final response = await request.close().timeout(timeout);
+      final latency = watch.elapsedMilliseconds;
+      if (response.statusCode >= 400) {
+        await response.drain<void>().timeout(timeout).catchError((_) {});
+        return _androidFailure(
+          node,
+          metric,
+          'http_status',
+          'HTTP ${response.statusCode}',
+          valueMs: latency,
+        );
+      }
+      if (metric == SpeedMetric.download) {
+        final readWatch = Stopwatch()..start();
+        var bytes = 0;
+        await for (final chunk in response.timeout(timeout)) {
+          bytes += chunk.length;
+          if (bytes >= 5 * 1024 * 1024) break;
+        }
+        final elapsed = readWatch.elapsedMilliseconds;
+        if (bytes == 0) {
+          return _androidFailure(
+            node,
+            metric,
+            'empty_body',
+            '测速地址没有返回数据',
+            valueMs: latency,
+          );
+        }
+        return SpeedResult(
+          nodeId: node.id,
+          metric: metric,
+          status: SpeedStatus.ok,
+          bytesPerSecond: elapsed > 0 ? (bytes * 1000 ~/ elapsed) : null,
+          bytesTransferred: bytes,
+        );
+      }
+      await response.drain<void>().timeout(timeout);
+      return SpeedResult(
+        nodeId: node.id,
+        metric: metric,
+        status: SpeedStatus.ok,
+        valueMs: latency,
+      );
+    } on Object catch (error) {
+      return _androidFailure(
+        node,
+        metric,
+        'probe_failed',
+        error.toString(),
+        valueMs: watch.elapsedMilliseconds,
+      );
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<bool> _waitForLocalPort(int port, Duration timeout) async {
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      try {
+        final socket = await Socket.connect(
+          '127.0.0.1',
+          port,
+          timeout: const Duration(milliseconds: 300),
+        );
+        socket.destroy();
+        return true;
+      } on Object {
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+    }
+    return false;
+  }
+
+  SpeedResult _androidCanceled(ProxyNode node, SpeedMetric metric) =>
+      SpeedResult(
+        nodeId: node.id,
+        metric: metric,
+        status: SpeedStatus.canceled,
+        errorCode: 'canceled',
+        errorMessage: '任务已取消',
+      );
+
+  SpeedResult _androidFailure(
+    ProxyNode node,
+    SpeedMetric metric,
+    String code,
+    String message, {
+    int? valueMs,
+  }) => SpeedResult(
+    nodeId: node.id,
+    metric: metric,
+    status: SpeedStatus.failed,
+    valueMs: valueMs,
+    errorCode: code,
+    errorMessage: message,
+  );
 
   // ------------------------------------------------------------------
   // Node list (database side)
@@ -1110,23 +1837,29 @@ class AppController {
     notifyExternalChange();
   }
 
-  /// Stores an import result and returns how many nodes are now present.
+  /// Stores an import result and returns the node total plus the connections
+  /// that were skipped because another profile already owns them.
   ///
-  /// Re-importing the same subscription updates rows in place instead of
-  /// duplicating them, because identity is the node fingerprint. The whole
-  /// batch goes through one transactioned [insertAll]: the per-row insert ran
+  /// Re-importing the same connection updates rows in place instead of
+  /// duplicating them, because identity is the node fingerprint — and that
+  /// identity is global now: pasting a list a subscription already carries
+  /// does not create a second copy, it reports the skips. The whole batch
+  /// goes through one transactioned [insertAll]: the per-row insert ran
   /// a SELECT and an implicit commit per node, which on a 5000-node paste
   /// meant ~10k statements on the UI isolate.
-  int saveImport(ImportResult result, {String source = ''}) {
+  ({int total, List<SkippedDuplicate> duplicates}) saveImport(
+    ImportResult result, {
+    String source = '',
+  }) {
     final now = DateTime.now().millisecondsSinceEpoch;
-    nodeRepo.insertAll(result.nodes, nowMs: now);
+    final written = nodeRepo.insertAll(result.nodes, nowMs: now);
     invalidateCatalogCache();
     catalogChanged();
     // Imported nodes are exactly what the tray menu's node list is made of, so
     // the catalogue has to be republished here; otherwise the tray keeps showing
     // the list it had before the import until something else changes.
     _publishTrayCatalog();
-    return loadNodes().length;
+    return (total: loadNodes().length, duplicates: written.skippedDuplicates);
   }
 
   void deleteNodes(Iterable<String> ids) {
@@ -1165,7 +1898,9 @@ class AppController {
   /// was already answered, and the user has no way to tell "not checked yet"
   /// from "checked and the result was thrown away".
   void _restoreUnlockResults() {
-    final snapshot = UnlockSnapshot.fromJson(_settings?.getJson(_kUnlockResults));
+    final snapshot = UnlockSnapshot.fromJson(
+      _settings?.getJson(_kUnlockResults),
+    );
     if (snapshot != null) unlock.restore(snapshot);
   }
 
@@ -1180,7 +1915,8 @@ class AppController {
   }
 
   /// Anything that wrote a node/subscription row outside [_command] calls this.
-  void notifyExternalChange() {    invalidateCatalogCache();
+  void notifyExternalChange() {
+    invalidateCatalogCache();
     catalogChanged();
     // Imports, deletions, renames and batch edits all land here, so this is the
     // one place that keeps the tray's node list in step with the database.
@@ -1214,7 +1950,8 @@ class AppController {
       // and it is the behaviour a user expects: pick something usable rather
       // than silently keep a broken selection.
       final activeId = runtime.snapshot?.activeNodeId;
-      final stale = activeId == null ||
+      final stale =
+          activeId == null ||
           activeId.isEmpty ||
           nodeRepo.nodeById(activeId) == null;
       if (stale) {
@@ -1238,10 +1975,7 @@ class AppController {
   Future<void> _ensureHost() async {
     final override = Platform.environment['HALO_HOST_EXE'];
     final base = File(Platform.resolvedExecutable).parent;
-    final candidates = [
-      ?override,
-      '${base.path}/halo-host.exe',
-    ];
+    final candidates = [?override, '${base.path}/halo-host.exe'];
     for (final candidate in candidates) {
       if (!await File(candidate).exists()) continue;
       // Detached host lifetime must not depend on this UI's standard handles.
@@ -1319,6 +2053,94 @@ class AppController {
   void connectionChanged() {
     if (_disposed) return;
     connectionRevision.value++;
+    _syncTrafficPolling();
+  }
+
+  /// Starts/stops the session throughput sampler.
+  ///
+  /// The sampler lives on the controller so the history and accumulated bytes
+  /// survive leaving and reopening the overview. Only Windows has the host
+  /// connection list this is derived from.
+  void _syncTrafficPolling() {
+    if (_snapshotInjectedForTest) return;
+    if (_disposed || !Platform.isWindows) {
+      _stopTrafficPolling(reset: true);
+      return;
+    }
+    if (!connected) {
+      // Keep the samples across a transient pipe drop: the host may come back
+      // with the same core, and the session totals are still meaningful.
+      _trafficTimer?.cancel();
+      _trafficTimer = null;
+      return;
+    }
+    final snap = runtime.snapshot;
+    final running = connected && snap != null && snap.coreState.isRunning;
+    final key = running ? (snap.corePid, snap.tunPid) : null;
+    if (key == _trafficCore) {
+      if (running && _trafficTimer == null) _startTrafficPolling();
+      if (!running && _trafficTimer != null) {
+        _stopTrafficPolling(reset: true);
+      }
+      return;
+    }
+    _trafficCore = key;
+    _stopTrafficPolling(reset: true);
+    if (running) _startTrafficPolling();
+    trafficRevision.value++;
+  }
+
+  void _startTrafficPolling() {
+    _trafficTimer?.cancel();
+    _trafficTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      unawaited(_pollTraffic());
+    });
+    // Sample immediately: otherwise a fresh page shows "等待采样…" for two
+    // seconds even though the connections are already available.
+    unawaited(_pollTraffic());
+  }
+
+  void _stopTrafficPolling({required bool reset}) {
+    _trafficTimer?.cancel();
+    _trafficTimer = null;
+    if (reset) {
+      _throughput.reset();
+      _trafficError = null;
+    }
+  }
+
+  Future<void> _pollTraffic() async {
+    if (_trafficPolling || _disposed || !Platform.isWindows) return;
+    _trafficPolling = true;
+    try {
+      _applyTraffic(await fetchTrafficSession());
+    } on Object catch (error) {
+      _trafficError = '$error';
+    } finally {
+      _trafficPolling = false;
+      if (!_disposed) trafficRevision.value++;
+    }
+  }
+
+  /// Reads the host's traffic clock.
+  ///
+  /// Overridable so a widget test can supply a snapshot without standing up a
+  /// host pipe; the production path is a host action and never samples the
+  /// connection list from this isolate.
+  @visibleForTesting
+  Future<TrafficSessionState> fetchTrafficSession() async {
+    final response = await client.send(
+      HaloAction.trafficGet,
+      timeout: const Duration(seconds: 4),
+    );
+    if (!response.ok) {
+      throw HaloError(
+        response.error?.code ?? HaloErrorCode.internal,
+        response.error?.message ?? '读取流量统计失败',
+        response.error?.detail,
+      );
+    }
+    return TrafficSessionState.fromJson(_jsonMap(response.result));
   }
 
   /// Only the one-line action-error strip needs repainting.
@@ -1343,6 +2165,10 @@ class AppController {
 
   Future<void> dispose() async {
     _disposed = true;
+    _androidStatusTimer?.cancel();
+    _androidStatusTimer = null;
+    _trafficTimer?.cancel();
+    _trafficTimer = null;
     unlock.dispose();
     subscriptions.dispose();
     await _streamSub?.cancel();
@@ -1352,6 +2178,8 @@ class AppController {
     await _logLines.close();
     await speed.dispose();
     runtime.dispose();
+    trafficRevision.dispose();
+    sessionRevision.dispose();
     catalogRevision.dispose();
     connectionRevision.dispose();
     errorRevision.dispose();
@@ -1375,8 +2203,63 @@ class AppController {
   ///   4. no active node applied → pick a node;
   ///   5. core not running       → start it;
   ///   6. no traffic path        → turn on the system proxy or TUN.
+  /// Android 的下一步提示。与 Windows 的宿主状态无关：节点表来自数据库，
+  /// 运行状态来自 `:vpn` 的状态文件。
+  NextStep? _androidNextStep() {
+    final nodes = loadNodes();
+    if (nodes.isEmpty) {
+      return NextStep(
+        page: HaloStepPage.subscriptions,
+        title: '先导入节点',
+        detail: '粘贴订阅链接或分享链接，导入后节点会出现在「节点」页。',
+        actionLabel: '去导入',
+        kind: NextStepKind.blocking,
+      );
+    }
+    final activeId = activeNodeId;
+    if (activeId == null || activeId.isEmpty) {
+      return NextStep(
+        page: HaloStepPage.nodes,
+        title: '选择一个节点',
+        detail: '已有 ${nodes.length} 个节点，选中一个并启用后才会开始代理。',
+        actionLabel: '去选择',
+        kind: NextStepKind.blocking,
+      );
+    }
+    final status = _androidVpnStatus;
+    if (status != null && status.isFailed) {
+      return NextStep(
+        page: HaloStepPage.overview,
+        title: 'VPN 启动失败',
+        detail: status.message.isEmpty ? '内核未能建立隧道，请查看日志后重试。' : status.message,
+        actionLabel: '重试',
+        action: NextStepAction.startCore,
+        kind: NextStepKind.blocking,
+      );
+    }
+    if (status != null && status.isStarting) {
+      return const NextStep(
+        page: HaloStepPage.overview,
+        title: '正在连接 VPN',
+        detail: '服务正在建立隧道。',
+        actionLabel: '刷新',
+        kind: NextStepKind.waiting,
+      );
+    }
+    if (status != null && status.isStarted) return null;
+    return const NextStep(
+      page: HaloStepPage.overview,
+      title: '代理未启动',
+      detail: '节点已选择。启动 VPN 后，流量才会经代理转发。',
+      actionLabel: '启动',
+      action: NextStepAction.startCore,
+      kind: NextStepKind.blocking,
+    );
+  }
+
   NextStep? get nextStep {
     if (!storeReady) return null;
+    if (Platform.isAndroid) return _androidNextStep();
     if (hostExiting) {
       // The host said goodbye and is shutting down. Offering 「重试连接」 here
       // would ask the user to reconnect to a process that is being torn down,

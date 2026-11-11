@@ -376,14 +376,53 @@ func (a *App) SetTun(enabled bool) (any, *contract.ErrorObj) {
 // Failure here must not fail the enable: the tunnel is already up and working,
 // and the caller has asked for TUN, not for proxy bookkeeping.
 func (a *App) tunTakesOverSystemProxy() {
-	if !a.Store.Snapshot().SystemProxy.Enabled {
+	snap := a.Store.Snapshot()
+	endpoint := snap.SystemProxy.Endpoint
+	if endpoint == "" {
+		endpoint = defaultProxyEndpoint
+	}
+	if snap.SystemProxy.Enabled {
+		if _, errObj := a.disableSystemProxyLocked(); errObj != nil {
+			a.Log.Writef("[host] TUN 已启用，但关闭系统代理失败: %s", errObj.Message)
+		}
+	}
+	// The snapshot can already say "off" while the registry still says on,
+	// especially after an external change or a host restart. RestoreIfUnchanged
+	// deliberately refuses that state, so clear it explicitly when it still
+	// points at our own mixed inbound.
+	clear := a.clearStaleProxy
+	if clear == nil && a.Proxy != nil {
+		clear = a.Proxy.DisableIfServer
+	}
+	if clear == nil {
 		return
 	}
-	if _, errObj := a.disableSystemProxyLocked(); errObj != nil {
-		a.Log.Writef("[host] TUN 已启用，但关闭系统代理失败: %s", errObj.Message)
+	changed, err := clear(endpoint)
+	if err != nil {
+		a.Log.Writef("[host] TUN 已启用，但清理残留系统代理失败: %v", err)
 		return
 	}
-	a.Log.Writef("[host] TUN 已接管流量，系统代理已关闭")
+	if !changed {
+		return
+	}
+	_, _ = a.Store.Update(func(s *state.Snapshot) {
+		s.SystemProxy.Enabled = false
+		s.SystemProxy.Restorable = false
+		s.SystemProxy.AppliedValue = ""
+		s.SystemProxy.AppliedProxyEnable = 0
+	})
+	a.Log.Writef("[host] TUN 已接管流量，清理了仍指向 %s 的系统代理", endpoint)
+}
+
+// ReconcileTunSystemProxy repairs the registry after a host restart. The
+// snapshot may still say TUN is enabled while a previous process left the
+// Windows proxy pointing at the local mixed inbound; without this the browser
+// keeps using that proxy instead of the tunnel.
+func (a *App) ReconcileTunSystemProxy() {
+	if a == nil || a.Store == nil || a.Store.Snapshot().TunState != state.TunEnabled {
+		return
+	}
+	a.tunTakesOverSystemProxy()
 }
 
 // tunCoreAlive reports whether pid names the running TUN core.

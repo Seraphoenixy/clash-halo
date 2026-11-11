@@ -14,6 +14,7 @@ ProxyNode _node(ProxyProtocol protocol,
         {Map<String, String?> secrets = const {},
         TlsConfig tls = const TlsConfig(),
         TransportConfig transport = const TransportConfig(),
+        Map<String, Object?> extras = const {},
         String server = 'example.com',
         int port = 443}) =>
     withIdentity(ProxyNode(
@@ -34,10 +35,31 @@ ProxyNode _node(ProxyProtocol protocol,
       ),
       tls: tls,
       transport: transport,
+      extras: extras,
     ));
+
+ProxyNode _naiveNode({required bool quic}) => _node(
+      ProxyProtocol.naive,
+      secrets: {'username': 'test-user', 'password': 'test-password'},
+      tls: const TlsConfig(kind: TlsKind.tls),
+      extras: {if (quic) 'naiveQuic': true},
+    );
 
 void main() {
   group('generator structure', () {
+    test('enables Naive UDP forwarding over HTTP/2 and HTTP/3', () {
+      for (final quic in [false, true]) {
+        final result = buildConfig(
+          ConfigRequest(node: _naiveNode(quic: quic)),
+          CoreCapabilities.singbox114,
+        );
+        expect(result.ok, isTrue);
+        final outbound = (result.config!.document['outbounds'] as List).first as Map;
+        expect(outbound['udp_over_tcp'], isTrue);
+        expect(outbound['quic'] == true, quic);
+      }
+    });
+
     test('encodes DoH URLs as a server, optional port and path', () {
       final node = _node(ProxyProtocol.socks, server: '1.2.3.4', port: 1080);
       Map remote(DnsSettings dns) {
@@ -67,6 +89,35 @@ void main() {
           'detour': 'proxy',
         },
       );
+    });
+
+    test('proxy server name is resolved by the direct resolver', () {
+      List dnsRules(String server, {bool ipv6 = false}) {
+        final result = buildConfig(
+          ConfigRequest(
+            node: _node(ProxyProtocol.socks, server: server, port: 1080),
+            dns: DnsSettings(ipv6: ipv6),
+          ),
+          CoreCapabilities.singbox114,
+        );
+        return (result.config!.document['dns'] as Map)['rules'] as List? ??
+            const [];
+      }
+
+      // Android's Naive outbound resolves its server through the system
+      // resolver. Without this rule that query is answered by the proxied DoH
+      // resolver, which itself needs the proxy: a deadlock that shows up as a
+      // connected VPN with no working traffic.
+      expect(dnsRules('img.example.com'), [
+        {'domain': ['img.example.com'], 'server': 'local'},
+        {'ip_version': 6, 'action': 'predefined', 'rcode': 'NOERROR'},
+      ]);
+      // An IP literal has nothing to resolve, and sing-box rejects addresses
+      // in a `domain` rule.
+      expect(dnsRules('203.0.113.7'), [
+        {'ip_version': 6, 'action': 'predefined', 'rcode': 'NOERROR'},
+      ]);
+      expect(dnsRules('203.0.113.7', ipv6: true), isEmpty);
     });
 
     test('emits a single active proxy outbound and system tags', () {
@@ -112,6 +163,22 @@ void main() {
       final route = result.config!.document['route'] as Map;
       expect(route['final'], 'direct');
       expect(result.config!.document.containsKey('dns'), isFalse);
+    });
+
+    test('sniff action leads every route mode', () {
+      final node = _node(ProxyProtocol.socks, server: '1.2.3.4', port: 1080);
+      for (final mode in RouteMode.values) {
+        final result = buildConfig(
+            ConfigRequest(node: node, mode: mode), CoreCapabilities.singbox114);
+        final rules =
+            ((result.config!.document['route'] as Map)['rules'] as List)
+                .cast<Map>();
+        expect(rules.first, {
+          'action': 'sniff',
+          'sniffer': ['tls', 'http', 'quic'],
+          'timeout': '300ms',
+        }, reason: mode.wire);
+      }
     });
 
     test('test inbound is added only when a test port is requested', () {
@@ -309,6 +376,8 @@ void main() {
               port: 443),
           'socks': _node(ProxyProtocol.socks, server: '1.2.3.4', port: 1080),
           'http': _node(ProxyProtocol.http, server: '1.2.3.4', port: 8080),
+          'naive-h2': _naiveNode(quic: false),
+          'naive-h3': _naiveNode(quic: true),
         };
 
     test('every generated protocol config passes sing-box check', () {

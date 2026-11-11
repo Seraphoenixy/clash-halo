@@ -80,8 +80,13 @@ type Options struct {
 	AdapterName string
 	// Stack is one of StackSystem, StackGvisor or StackMixed.
 	Stack string
-	// Address is a single CIDR prefix, e.g. "172.19.0.1/30".
+	// Address is the IPv4 CIDR prefix, e.g. "172.19.0.1/30".
 	Address string
+	// Address6 is the IPv6 CIDR prefix. It must stay non-empty while
+	// StrictRoute is enabled: sing-tun's Windows backend adds a WFP "block
+	// ipv6" filter when the TUN has no IPv6 address, which also makes ::1
+	// unreachable and breaks localhost-only development servers.
+	Address6 string
 	// MTU is written only when non-zero.
 	MTU int
 	// AutoRoute lets sing-box install the routes for the tunnel.
@@ -104,6 +109,7 @@ func DefaultOptions() Options {
 		AdapterName: "clash-halo",
 		Stack:       StackMixed,
 		Address:     "172.19.0.1/30",
+		Address6:    "fdfe:dcba:9876::1/126",
 		MTU:         9000,
 		AutoRoute:   true,
 		StrictRoute: true,
@@ -131,11 +137,15 @@ type wireTunInbound struct {
 // Surrounding whitespace is trimmed so a value pasted into the UI cannot make
 // the core fail on a name that merely looks different.
 func (opts Options) inbound() wireTunInbound {
+	addresses := []string{strings.TrimSpace(opts.Address)}
+	if address6 := strings.TrimSpace(opts.Address6); address6 != "" {
+		addresses = append(addresses, address6)
+	}
 	return wireTunInbound{
 		Type:          "tun",
 		Tag:           TunTag,
 		InterfaceName: strings.TrimSpace(opts.AdapterName),
-		Address:       []string{strings.TrimSpace(opts.Address)},
+		Address:       addresses,
 		MTU:           opts.MTU,
 		AutoRoute:     opts.AutoRoute,
 		StrictRoute:   opts.StrictRoute,
@@ -159,8 +169,26 @@ func Validate(opts Options) error {
 		return fmt.Errorf("%w: %d（0 表示不写入该字段，否则须为 %d..%d）",
 			ErrInvalidMTU, opts.MTU, MinMTU, MaxMTU)
 	}
-	if _, _, err := net.ParseCIDR(strings.TrimSpace(opts.Address)); err != nil {
-		return fmt.Errorf("%w: %q 不是合法的 CIDR 前缀", ErrInvalidAddress, opts.Address)
+	if err := validateTunAddress(opts.Address, false); err != nil {
+		return err
+	}
+	if err := validateTunAddress(opts.Address6, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateTunAddress(raw string, ipv6 bool) error {
+	address := strings.TrimSpace(raw)
+	ip, _, err := net.ParseCIDR(address)
+	if err != nil {
+		return fmt.Errorf("%w: %q 不是合法的 CIDR 前缀", ErrInvalidAddress, raw)
+	}
+	if ipv6 && ip.To4() != nil {
+		return fmt.Errorf("%w: %q 不是 IPv6 地址", ErrInvalidAddress, raw)
+	}
+	if !ipv6 && ip.To4() == nil {
+		return fmt.Errorf("%w: %q 不是 IPv4 地址", ErrInvalidAddress, raw)
 	}
 	return nil
 }
@@ -286,8 +314,8 @@ func AdapterName(raw []byte) (string, error) {
 // is forced to true because otherwise Windows routes the proxy's own outbound
 // traffic back into the tunnel, which is a silent, total loss of connectivity.
 //
-// DoH URLs emitted by older Halo versions are converted to structured
-// endpoints. All unrelated keys are preserved. raw itself is never modified.
+// DNS settings emitted by older Halo versions are normalized for the current
+// core. All unrelated keys are preserved. raw itself is never modified.
 func Inject(raw []byte, opts Options) ([]byte, error) {
 	if err := Validate(opts); err != nil {
 		return nil, err
@@ -341,8 +369,36 @@ func Inject(raw []byte, opts Options) ([]byte, error) {
 	}
 	obj["route"] = encodedRoute
 	repairDoHEndpoints(obj)
+	repairIPv6DNSRule(obj)
 
 	return json.Marshal(obj)
+}
+
+// Upgrades keep active.json, so TUN can start from an older generated config
+// before the UI generates a new one. Return NODATA for the old IPv6-off rule
+// to avoid the resolver retries triggered by REFUSED.
+func repairIPv6DNSRule(obj map[string]json.RawMessage) {
+	var dns map[string]json.RawMessage
+	if json.Unmarshal(obj["dns"], &dns) != nil {
+		return
+	}
+	var rules []json.RawMessage
+	if json.Unmarshal(dns["rules"], &rules) != nil {
+		return
+	}
+	changed := false
+	for i, raw := range rules {
+		var rule map[string]json.RawMessage
+		if json.Unmarshal(raw, &rule) == nil && len(rule) == 2 &&
+			string(rule["ip_version"]) == "6" && string(rule["action"]) == `"reject"` {
+			rules[i] = json.RawMessage(`{"ip_version":6,"action":"predefined","rcode":"NOERROR"}`)
+			changed = true
+		}
+	}
+	if changed {
+		dns["rules"], _ = json.Marshal(rules)
+		obj["dns"], _ = json.Marshal(dns)
+	}
 }
 
 // Older active configs put the full DoH URL in server. sing-box check accepts

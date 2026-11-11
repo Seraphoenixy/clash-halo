@@ -94,7 +94,7 @@ class _RulesPageState extends State<RulesPage> {
       // active, and the first version of this notice claimed the config had
       // been reapplied in exactly that case — a message that says something
       // happened when nothing did is worse than saying nothing.
-      final applied = c.snapshot?.activeNodeId?.isNotEmpty ?? false;
+      final applied = c.activeNodeId?.isNotEmpty ?? false;
       if (mounted) {
         setState(() {
           _saved = List<RoutingRule>.of(_draft);
@@ -168,7 +168,6 @@ class _RulesPageState extends State<RulesPage> {
   @override
   Widget build(BuildContext context) {
     final p = HaloPalette.of(context);
-    final snapshot = c.snapshot;
     final mode = c.routing.mode;
     final ruleModeActive = mode == RouteMode.rule;
 
@@ -269,7 +268,7 @@ class _RulesPageState extends State<RulesPage> {
                                 ),
                               ),
                               const Spacer(),
-                              if (snapshot?.activeNodeId == null)
+                              if (c.activeNodeId == null)
                                 Text(
                                   '尚未选择节点，规则保存后不会立即生效',
                                   style: TextStyle(

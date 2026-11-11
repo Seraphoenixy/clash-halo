@@ -28,12 +28,17 @@ var (
 	freeConsole        = windows.NewLazySystemDLL("kernel32.dll").NewProc("FreeConsole")
 )
 
-// IsAdapterConflict recognises the wintun error pair that means an old
-// registration still owns the name.
+// IsAdapterConflict recognises Wintun failures that can be retried with a
+// different adapter name (and therefore a different device GUID).
 //
 // Both halves are required: "create adapter" alone can be a permissions
 // problem, and "open existing adapter" alone can be a healthy reuse.
 func IsAdapterConflict(output string) bool {
+	// Windows can also reject the existing device instance with
+	// CR_INVALID_DEVNODE. sing-box reports ERROR_FILE_NOT_FOUND from TUN setup.
+	if strings.Contains(output, "configure tun interface: The system cannot find the file specified.") {
+		return true
+	}
 	return strings.Contains(output, "create adapter: Cannot create a file when that file already exists") &&
 		strings.Contains(output, "open existing adapter: Element not found")
 }

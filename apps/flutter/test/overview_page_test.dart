@@ -5,6 +5,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:halo/src/state/app_controller.dart';
 import 'package:halo/src/state/exit_info.dart';
 import 'package:halo/src/state/home_cards.dart';
+import 'package:halo/src/state/session_state.dart';
 import 'package:halo/src/theme.dart';
 import 'package:halo/src/ui/pages/overview_page.dart';
 import 'package:halo/src/ui/widgets.dart';
@@ -14,12 +15,25 @@ import 'package:halo_domain/halo_domain.dart';
 class _OverviewController extends AppController {
   _OverviewController({required super.dataDir});
 
-  ConnectionsSnapshot? connections;
+  TrafficSessionState? traffic;
 
   @override
-  Future<ConnectionsSnapshot> fetchConnections() async =>
-      connections ?? await super.fetchConnections();
+  Future<TrafficSessionState> fetchTrafficSession() async =>
+      traffic ?? super.fetchTrafficSession();
 }
+
+const _idleTraffic = TrafficSessionState(
+  upRate: 0,
+  downRate: 0,
+  uploadTotal: 0,
+  downloadTotal: 0,
+  peakUp: 0,
+  peakDown: 0,
+  history: [],
+  activeConnections: 1,
+  updatedAtMs: 0,
+  error: null,
+);
 
 /// The dashboard is now a card grid whose contents the user chooses, so the
 /// things worth pinning are: every card is reachable, the choice survives, and
@@ -62,10 +76,7 @@ void main() {
       MaterialApp(
         theme: buildHaloTheme(Brightness.light),
         home: Scaffold(
-          body: OverviewPage(
-            controller: controller,
-            exitService: exitService,
-          ),
+          body: OverviewPage(controller: controller, exitService: exitService),
         ),
       ),
     );
@@ -75,14 +86,7 @@ void main() {
   testWidgets('every default card is on the page', (tester) async {
     await pump(tester);
     expect(tester.takeException(), isNull);
-    for (final title in [
-      '当前节点',
-      '实时流量',
-      '出口信息',
-      '代理内核',
-      '系统代理',
-      '运行信息',
-    ]) {
+    for (final title in ['当前节点', '实时流量', '出口信息', '代理内核', '系统代理', '运行信息']) {
       expect(find.text(title), findsWidgets, reason: title);
     }
     // A stopped core says so on the traffic and exit cards instead of showing
@@ -103,10 +107,12 @@ void main() {
     // Scoped to the dialog: the page's own cards carry switches too (系统代理,
     // TUN), so an unscoped index would flip one of those instead.
     await tester.tap(
-      find.descendant(
-        of: find.byType(AlertDialog),
-        matching: find.byType(HaloSwitch),
-      ).at(1),
+      find
+          .descendant(
+            of: find.byType(AlertDialog),
+            matching: find.byType(HaloSwitch),
+          )
+          .at(1),
     );
     await tester.pump();
     await tester.tap(find.text('完成'));
@@ -118,7 +124,9 @@ void main() {
     expect(controller.settingsRepo.getJson(HomeCards.storageKey), ['traffic']);
   });
 
-  testWidgets('the stored choice is honoured on the next build', (tester) async {
+  testWidgets('the stored choice is honoured on the next build', (
+    tester,
+  ) async {
     HomeCards.defaults.toggle(HomeCard.exit).save(controller.settingsRepo);
     await pump(tester);
     expect(find.text('出口信息'), findsNothing);
@@ -204,14 +212,7 @@ void main() {
   testWidgets('traffic card shows sampled totals and only proxy connections', (
     tester,
   ) async {
-    controller.connections = const ConnectionsSnapshot(
-      uploadTotal: 7000,
-      downloadTotal: 9000,
-      connections: [
-        LiveConnection(id: 'a', host: 'proxy.example', chains: ['proxy']),
-        LiveConnection(id: 'b', host: 'direct.example', chains: ['direct']),
-      ],
-    );
+    controller.traffic = _idleTraffic;
     controller.applySnapshotForTest(
       const RuntimeSnapshot(stateVersion: 4, coreState: CoreState.running),
       connected: true,
@@ -220,6 +221,25 @@ void main() {
 
     expect(find.text('代理连接 1'), findsOneWidget);
     expect(find.text('采样累计 ↑0 B ↓0 B'), findsOneWidget);
+  });
+
+  testWidgets('traffic stats survive leaving and reopening the page', (
+    tester,
+  ) async {
+    controller.traffic = _idleTraffic;
+    controller.applySnapshotForTest(
+      const RuntimeSnapshot(stateVersion: 5, coreState: CoreState.running),
+      connected: true,
+    );
+    await pump(tester, exitService: stubExit());
+    expect(find.text('代理连接 1'), findsOneWidget);
+
+    // Leave the page. The monitor belongs to the controller, so this must not
+    // reset the session's connection count or totals.
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump();
+    await pump(tester, exitService: stubExit());
+    expect(find.text('代理连接 1'), findsOneWidget);
   });
 
   testWidgets('no banner when the core runs but nothing is intercepted', (

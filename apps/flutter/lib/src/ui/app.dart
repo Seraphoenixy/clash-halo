@@ -1,9 +1,11 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:halo_contracts/halo_contracts.dart';
 
 import '../state/app_controller.dart';
 import '../theme.dart';
+import 'pages/android_overview_page.dart';
 import 'pages/connections_page.dart';
 import 'pages/logs_page.dart';
 import 'pages/nodes_page.dart';
@@ -27,6 +29,12 @@ class HaloApp extends StatefulWidget {
 
 class _HaloAppState extends State<HaloApp> {
   HaloPage _page = HaloPage.overview;
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  bool _sidebarCollapsed = false;
+
+  /// Below this the rail does not fit beside a usable page: it becomes a
+  /// drawer and the header gets a menu button.
+  static const double _compactBreakpoint = 760;
 
   AppController get controller => widget.controller;
 
@@ -54,64 +62,114 @@ class _HaloAppState extends State<HaloApp> {
     }
   }
 
+  /// Re-probes the platform's status source.
+  ///
+  /// Windows retries the host pipe; Android re-reads the `:vpn` status and
+  /// starts it again only when it is genuinely stopped or failed.
+  Future<void> _retryConnection() async {
+    try {
+      if (controller.isAndroid) {
+        await controller.retryAndroidVpn();
+      } else {
+        await controller.retryConnect();
+      }
+    } catch (_) {
+      // The controller records the reason for the error strip.
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Three listeners on *narrow* channels instead of one on a global counter.
-    //
-    // The previous root rebuilt the sidebar and the whole page tree on every
-    // notification — a log line, a failed command, an unrelated reconnect. On a
-    // page holding a 10k-row list that rebuild is the jank the user felt. The
-    // sidebar only cares about liveness and the outstanding step; the page host
-    // only cares about which page is shown; the status bar re-reads the snapshot
-    // it needs.
+    final content = _buildContent();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxWidth < _compactBreakpoint;
+        if (compact) {
+          return Scaffold(
+            key: _scaffoldKey,
+            drawer: Drawer(
+              width: HaloMetrics.sidebarWidth,
+              child: SafeArea(
+                bottom: false,
+                child: _buildSidebar(compact: true, closeDrawer: true),
+              ),
+            ),
+            body: SafeArea(
+              child: HaloPageMenu(
+                onOpen: () => _scaffoldKey.currentState?.openDrawer(),
+                child: content,
+              ),
+            ),
+          );
+        }
+        return SafeArea(
+          child: Row(
+            children: [
+              _buildSidebar(compact: false, closeDrawer: false),
+              Expanded(child: content),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// The sidebar listens to connection, runtime and catalog revisions because
+  /// its footer and the attention dot change on all three.
+  Widget _buildSidebar({required bool compact, required bool closeDrawer}) {
+    return ValueListenableBuilder<int>(
+      valueListenable: controller.connectionRevision,
+      builder: (context, _, _) => ValueListenableBuilder<int>(
+        valueListenable: controller.runtimeRevision,
+        builder: (context, _, _) => ValueListenableBuilder<int>(
+          valueListenable: controller.catalogRevision,
+          builder: (context, _, _) {
+            final step = controller.nextStep;
+            final isAndroid = controller.isAndroid;
+            return HaloSidebar(
+              current: _page,
+              onSelect: (page) {
+                if (closeDrawer) _scaffoldKey.currentState?.closeDrawer();
+                _open(page);
+              },
+              connected: isAndroid
+                  ? controller.androidVpnActive
+                  : controller.connected,
+              coreRunning: isAndroid
+                  ? controller.androidVpnStarted
+                  : (controller.snapshot?.coreState.isRunning ?? false),
+              isAndroid: isAndroid,
+              compact: compact,
+              collapsed: !compact && _sidebarCollapsed,
+              onToggle: compact
+                  ? null
+                  : () =>
+                        setState(() => _sidebarCollapsed = !_sidebarCollapsed),
+              blockedPage: step == null ? null : HaloPage.forStep(step.page),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildContent() {
     return Column(
       children: [
         Expanded(
-          child: Row(
-            children: [
-              ValueListenableBuilder<int>(
-                // Connection *and* runtime, because both change what the footer
-                // and the attention dot say.
-                valueListenable: controller.connectionRevision,
-                builder: (context, _, _) => ValueListenableBuilder<int>(
-                  valueListenable: controller.runtimeRevision,
-                  builder: (context, _, _) => ValueListenableBuilder<int>(
-                    valueListenable: controller.catalogRevision,
-                    builder: (context, _, _) {
-                      final step = controller.nextStep;
-                      return HaloSidebar(
-                        current: _page,
-                        onSelect: _open,
-                        connected: controller.connected,
-                        coreRunning:
-                            controller.snapshot?.coreState.isRunning ?? false,
-                        blockedPage: step == null
-                            ? null
-                            : HaloPage.forStep(step.page),
-                      );
-                    },
-                  ),
-                ),
-              ),
-              // The sidebar draws its own right border, so a divider here
-              // would double it.
-              Expanded(
-                child: ValueListenableBuilder<int>(
-                  // start() is deferred past the first frame, so a store that
-                  // fails to open is only discovered after this subtree has
-                  // already built. Without a listener here the error panel
-                  // never rendered and the user got a normal-looking but empty
-                  // window.
-                  valueListenable: controller.errorRevision,
-                  builder: (context, _, _) => _PageHost(
-                    page: _page,
-                    controller: controller,
-                    onOpenPage: _open,
-                    onRunStep: _runStep,
-                  ),
-                ),
-              ),
-            ],
+          child: ValueListenableBuilder<int>(
+            // start() is deferred past the first frame, so a store that
+            // fails to open is only discovered after this subtree has
+            // already built. Without a listener here the error panel
+            // never rendered and the user got a normal-looking but empty
+            // window.
+            valueListenable: controller.errorRevision,
+            builder: (context, _, _) => _PageHost(
+              page: _page,
+              controller: controller,
+              onOpenPage: _open,
+              onRunStep: _runStep,
+            ),
           ),
         ),
         ValueListenableBuilder<int>(
@@ -125,16 +183,30 @@ class _HaloAppState extends State<HaloApp> {
                 valueListenable: controller.catalogRevision,
                 builder: (context, _, _) {
                   final snap = controller.snapshot;
+                  final isAndroid = controller.isAndroid;
                   return HaloStatusBar(
                     snapshot: snap,
                     connected: controller.connected,
                     nextStep: controller.nextStep,
-                    activeNodeName: snap?.activeNodeName,
+                    activeNodeName: controller.activeNodeName,
+                    isAndroid: isAndroid,
+                    androidCoreState: isAndroid
+                        ? controller.androidCoreState
+                        : null,
+                    androidVpnLabel: isAndroid
+                        ? controller.androidVpnLabel
+                        : null,
+                    mode: isAndroid
+                        ? ProxyMode.fromWire(controller.routing.mode.wire)
+                        : null,
+                    intercepted: isAndroid
+                        ? controller.androidVpnStarted
+                        : null,
                     onOpenStep: () {
                       final step = controller.nextStep;
                       if (step != null) unawaited(_runStep(step));
                     },
-                    onRetryConnect: () => unawaited(controller.retryConnect()),
+                    onRetryConnect: () => unawaited(_retryConnection()),
                   );
                 },
               ),
@@ -192,13 +264,22 @@ class _PageHost extends StatelessWidget {
     // Diagnostics pages are self-sufficient: logs stream, settings reads once,
     // and neither renders runtime state that a snapshot tick would change.
     final body = switch (page) {
-      HaloPage.overview => _watching(
-        () => OverviewPage(
-          controller: controller,
-          onOpenPage: onOpenPage,
-          onRunStep: onRunStep,
-        ),
-      ),
+      HaloPage.overview =>
+        controller.isAndroid
+            ? _watching(
+                () => AndroidOverviewPage(
+                  controller: controller,
+                  onOpenPage: onOpenPage,
+                  onRunStep: onRunStep,
+                ),
+              )
+            : _watching(
+                () => OverviewPage(
+                  controller: controller,
+                  onOpenPage: onOpenPage,
+                  onRunStep: onRunStep,
+                ),
+              ),
       HaloPage.nodes => _watching(
         () => NodesPage(
           controller: controller,
@@ -211,9 +292,7 @@ class _PageHost extends StatelessWidget {
           onOpenNodes: () => onOpenPage(HaloPage.nodes),
         ),
       ),
-      HaloPage.routing => _watching(
-        () => RulesPage(controller: controller),
-      ),
+      HaloPage.routing => _watching(() => RulesPage(controller: controller)),
       HaloPage.test => _watching(
         () => UnlockPage(
           controller: controller,
@@ -255,11 +334,31 @@ class _PageHost extends StatelessWidget {
   }
 }
 
-/// A page frame: fixed header with title/actions and a scrollable body.
+/// Lets a page header open the compact drawer without every page threading a
+/// callback down. The scope exists only while the rail is a drawer; on wide
+/// layouts [maybeOf] returns null and no menu button is drawn.
+class HaloPageMenu extends InheritedWidget {
+  const HaloPageMenu({super.key, required this.onOpen, required super.child});
+
+  final VoidCallback onOpen;
+
+  static HaloPageMenu? maybeOf(BuildContext context) =>
+      context.dependOnInheritedWidgetOfExactType<HaloPageMenu>();
+
+  @override
+  bool updateShouldNotify(HaloPageMenu oldWidget) => oldWidget.onOpen != onOpen;
+}
+
+/// A page frame: header with title/actions and a scrollable body.
 ///
 /// The header sits directly on the canvas with a hairline underneath, which is
 /// how Fluent separates window chrome from content without introducing another
 /// surface colour.
+///
+/// Below 760 logical pixels the header becomes two rows: the title row carries
+/// the drawer button, and the actions sit in a horizontally scrollable row.
+/// No button is hidden, and the header no longer overflows when a page has
+/// three or four actions.
 class HaloPageScaffold extends StatelessWidget {
   const HaloPageScaffold({
     super.key,
@@ -280,57 +379,128 @@ class HaloPageScaffold extends StatelessWidget {
   final double? maxContentWidth;
   final Widget child;
 
+  /// Keep in sync with [_HaloAppState._compactBreakpoint].
+  static const double compactBreakpoint = 760;
+
   @override
   Widget build(BuildContext context) {
     final p = HaloPalette.of(context);
     final text = Theme.of(context).textTheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
+    final menu = HaloPageMenu.maybeOf(context);
+    final compact = MediaQuery.sizeOf(context).width < compactBreakpoint;
+    final horizontal = compact ? 8.0 : HaloMetrics.contentPadding;
+
+    final titleBlock = Column(
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Container(
-          height: HaloMetrics.pageHeaderHeight,
-          padding: const EdgeInsets.symmetric(
-            horizontal: HaloMetrics.contentPadding,
+        Text(
+          title,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: text.titleLarge,
+        ),
+        if (subtitle != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 1),
+            child: Text(
+              subtitle!,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: text.bodySmall,
+            ),
           ),
-          decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: p.border)),
-          ),
-          child: Row(
+      ],
+    );
+
+    final actionRow = actions.isEmpty
+        ? null
+        : Row(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Expanded(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: text.titleLarge,
-                    ),
-                    if (subtitle != null)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 1),
-                        child: Text(
-                          subtitle!,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: text.bodySmall,
-                        ),
-                      ),
-                  ],
-                ),
-              ),
               for (final action in actions) ...[
                 const SizedBox(width: 8),
                 action,
               ],
             ],
+          );
+
+    // Touch platforms get the larger action targets even in the wide header;
+    // a tablet with a mouse still benefits, and a desktop window keeps 32 px.
+    final touch = haloTouchPlatform(context);
+    final themedActions = actionRow == null
+        ? null
+        : (compact || touch)
+        ? _compactActionTheme(context, actionRow)
+        : actionRow;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Container(
+          constraints: BoxConstraints(
+            minHeight: compact ? 92 : HaloMetrics.pageHeaderHeight,
           ),
+          padding: EdgeInsets.fromLTRB(
+            horizontal,
+            compact ? 6 : 0,
+            horizontal,
+            compact ? 6 : 0,
+          ),
+          decoration: BoxDecoration(
+            border: Border(bottom: BorderSide(color: p.border)),
+          ),
+          child: compact
+              ? Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        if (menu != null)
+                          IconButton(
+                            onPressed: menu.onOpen,
+                            tooltip: '打开导航',
+                            icon: const Icon(Icons.menu),
+                            iconSize: 20,
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints.tightFor(
+                              width: 40,
+                              height: 40,
+                            ),
+                          ),
+                        Expanded(child: titleBlock),
+                      ],
+                    ),
+                    if (themedActions != null)
+                      SizedBox(
+                        height: 40,
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: themedActions,
+                        ),
+                      ),
+                  ],
+                )
+              : Row(
+                  children: [
+                    Expanded(child: titleBlock),
+                    if (themedActions != null)
+                      Flexible(
+                        fit: FlexFit.loose,
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          reverse: true,
+                          child: themedActions,
+                        ),
+                      ),
+                  ],
+                ),
         ),
         Expanded(
           child: Padding(
-            padding: const EdgeInsets.all(HaloMetrics.contentPadding),
+            padding: EdgeInsets.all(compact ? 10 : HaloMetrics.contentPadding),
             child: maxContentWidth == null
                 ? child
                 : Align(
@@ -343,6 +513,31 @@ class HaloPageScaffold extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+
+  /// Tougher vertical targets in the compact header. Explicit styles on a page
+  /// button still win; this only lifts the defaults to a touch-sized 40 px.
+  Widget _compactActionTheme(BuildContext context, Widget child) {
+    final base = Theme.of(context);
+    final size = const Size(0, 40);
+    const padding = EdgeInsets.symmetric(horizontal: 14);
+    return Theme(
+      data: base.copyWith(
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(minimumSize: size, padding: padding),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(minimumSize: size, padding: padding),
+        ),
+        textButtonTheme: TextButtonThemeData(
+          style: TextButton.styleFrom(minimumSize: size, padding: padding),
+        ),
+        iconButtonTheme: IconButtonThemeData(
+          style: IconButton.styleFrom(minimumSize: const Size(40, 40)),
+        ),
+      ),
+      child: child,
     );
   }
 }
@@ -456,9 +651,9 @@ class _ActionErrorBar extends StatelessWidget {
               message,
               maxLines: 2,
               overflow: TextOverflow.ellipsis,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: p.textPrimary,
-              ),
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: p.textPrimary),
             ),
           ),
         ],

@@ -34,7 +34,10 @@ void main() {
       final controller = AppController(dataDir: dir.path);
       try {
         await controller.start(connectHost: false);
-        final local = importNodes(body);
+        // A paste box entry that is NOT what the subscription serves: identity
+        // is global now, so the same link pasted and subscribed would live in
+        // one row (owned by 本地) instead of two.
+        final local = importNodes('trojan://password@pasted.example:443#pasted');
         controller.saveImport(local);
         final profile = SubscriptionProfile(
           id: 'test',
@@ -62,7 +65,7 @@ void main() {
         // built-in 本地 subscription, not under the refreshed one.
         final localCopies = controller.nodeRepo.nodesForProfile(kLocalProfileId);
         expect(localCopies, hasLength(1));
-        expect(localCopies.single.server, 'first.example');
+        expect(localCopies.single.server, 'pasted.example');
         // The adoption is what makes that true, so it is asserted rather than
         // assumed: no node may be left outside a subscription.
         expect(
@@ -86,6 +89,51 @@ void main() {
       }
     },
   );
+
+  test('a refresh does not duplicate a connection the paste box already owns', () async {
+    // The old behaviour stored one copy per subscription: pasting a link that a
+    // subscription also carried left two rows with two names, and every refresh
+    // of either source kept them both alive. Identity is global now — the pool
+    // keeps one row, owned by whoever imported first, and the refresh reports
+    // what it skipped instead of quietly re-importing it.
+    final dir = Directory.systemTemp.createTempSync('halo-subscription-cross-');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((request) async {
+      request.response.write('trojan://password@first.example:443#original');
+      await request.response.close();
+    });
+    final controller = AppController(dataDir: dir.path);
+    try {
+      await controller.start(connectHost: false);
+      controller.saveImport(importNodes('trojan://password@first.example:443#original'));
+      const profile = SubscriptionProfile(
+        id: 'test',
+        name: 'test',
+        url: 'http://127.0.0.1:0',
+      );
+      final subscribed = profile.copyWith(url: 'http://127.0.0.1:${server.port}');
+      controller.subscriptionRepo.upsert(subscribed);
+
+      final update = await controller.updateSubscription(subscribed);
+      expect(controller.loadNodes(), hasLength(1),
+          reason: 'the connection exists exactly once');
+      expect(controller.loadNodes().single.profileId, kLocalProfileId,
+          reason: 'the first import owns the connection');
+      expect(update.crossDuplicateCount, 1);
+      expect(update.crossDuplicates.single.message, startsWith('已存在于订阅'));
+      // The row's node count is what the profile owns after the replace, not
+      // what the source listed — the two must agree with the node page filter.
+      expect(controller.subscriptionRepo.profileById(profile.id)!.nodeCount, 0);
+
+      final logged = ImportLogRepository(controller.store).recent(limit: 1).single;
+      final detail = jsonDecode('${logged['detail']}') as Map<String, Object?>;
+      expect(detail['crossDuplicates'], 1);
+    } finally {
+      await controller.dispose();
+      await server.close(force: true);
+      dir.deleteSync(recursive: true);
+    }
+  });
 
   test('a refresh records what it refused, with the entries themselves', () async {
     final dir = Directory.systemTemp.createTempSync('halo-subscription-log-');

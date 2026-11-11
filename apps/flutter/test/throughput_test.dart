@@ -128,7 +128,14 @@ void main() {
           download: down,
         );
 
-    monitor.sample(snap(connections: [row('a', ['proxy'], 10, 20)]), t0);
+    monitor.sample(
+      snap(
+        connections: [
+          row('a', ['proxy'], 10, 20),
+        ],
+      ),
+      t0,
+    );
     expect(monitor.uploadTotal, 0);
     monitor.sample(
       snap(
@@ -152,7 +159,11 @@ void main() {
     expect(monitor.history.last, (120.0, 240.0));
 
     monitor.sample(
-      snap(connections: [row('direct', ['direct'], 2000, 3000)]),
+      snap(
+        connections: [
+          row('direct', ['direct'], 2000, 3000),
+        ],
+      ),
       t0.add(const Duration(seconds: 4)),
     );
     expect(monitor.activeConnections, 0);
@@ -188,6 +199,29 @@ void main() {
     m.sample(snap(up: 0), t0);
     m.sample(snap(up: 999), t0.add(const Duration(milliseconds: 10)));
     expect(m.upRate, 0, reason: '过短的间隔不应产生速率');
+  });
+
+  test('restore adopts the host session instead of starting at zero', () {
+    final m = ThroughputMonitor(historyLength: 3);
+    m.restore(
+      uploadTotal: 7000,
+      downloadTotal: 9000,
+      upRate: 12,
+      downRate: 34,
+      peakUp: 120,
+      peakDown: 340,
+      history: const [(1.0, 2.0), (3.0, 4.0)],
+      activeConnections: 5,
+    );
+
+    expect(m.uploadTotal, 7000);
+    expect(m.downloadTotal, 9000);
+    expect(m.upRate, 12);
+    expect(m.downRate, 34);
+    expect(m.peakUp, 120);
+    expect(m.activeConnections, 5);
+    expect(m.hasCurve, isTrue);
+    expect(m.history.length, 2);
   });
 
   test('rate labels use the same units as totals', () {

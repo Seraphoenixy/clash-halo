@@ -922,7 +922,10 @@ class _HaloMenuPositionDelegate extends SingleChildLayoutDelegate {
     // Then clamp, so a menu taller than the window is not pushed off the top.
     return Offset(
       dx.clamp(margin, math.max(margin, size.width - childSize.width - margin)),
-      dy.clamp(margin, math.max(margin, size.height - childSize.height - margin)),
+      dy.clamp(
+        margin,
+        math.max(margin, size.height - childSize.height - margin),
+      ),
     );
   }
 
@@ -1086,6 +1089,8 @@ class _HaloMenuPanelState<T> extends State<_HaloMenuPanel<T>> {
   }
 
   Widget _buildEntry(BuildContext context, int index) {
+    // Touch keyboards do not exist; the shortcut column is desktop-only.
+    final showShortcuts = !haloTouchPlatform(context);
     final entry = widget.entries[index];
     if (entry is HaloMenuDivider<T>) {
       return Padding(
@@ -1143,7 +1148,7 @@ class _HaloMenuPanelState<T> extends State<_HaloMenuPanel<T>> {
               ],
             ),
           ),
-          if (_hasShortcut) ...[
+          if (showShortcuts && _hasShortcut) ...[
             const SizedBox(width: 16),
             // The box is reserved even for a row without a shortcut, so the
             // column is one edge for every row rather than a per-row position.
@@ -1198,7 +1203,9 @@ class _HaloMenuRowState extends State<_HaloMenuRow> {
     final p = HaloPalette.of(context);
     final active = widget.highlighted || _hovered;
     return MouseRegion(
-      cursor: widget.enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      cursor: widget.enabled
+          ? SystemMouseCursors.click
+          : SystemMouseCursors.basic,
       onEnter: (_) {
         setState(() => _hovered = true);
         widget.onHover?.call();
@@ -1394,6 +1401,7 @@ class HaloSelector<T> extends StatelessWidget {
     required this.value,
     required this.onChanged,
     this.enabled = true,
+    this.height = HaloMetrics.controlHeight,
   });
 
   final List<(T value, String label)> options;
@@ -1401,12 +1409,15 @@ class HaloSelector<T> extends StatelessWidget {
   final ValueChanged<T>? onChanged;
   final bool enabled;
 
+  /// Defaults to the desktop control height; touch pages pass 44.
+  final double height;
+
   @override
   Widget build(BuildContext context) {
     final p = HaloPalette.of(context);
     final text = Theme.of(context).textTheme;
     return Container(
-      height: HaloMetrics.controlHeight,
+      height: height,
       padding: const EdgeInsets.all(2),
       decoration: BoxDecoration(
         color: p.isDark ? p.input : HaloColors.lightSurfaceAlt,

@@ -11,20 +11,27 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- libbox 初始化网络监控（PlatformInterface.getInterfaces /
+         notifyDefaultInterface）需要读默认网络；缺它时内核启动报
+         "Neither user ... has android.permission.ACCESS_NETWORK_STATE"。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- No application@label here: a library manifest must not override the
+         app's label (manifest merger would fail on the conflict). -->
     <application
-        android:label="Clash Halo"
         tools:ignore="MissingApplicationIcon">
 
         <!--
           :vpn 独立进程；exported=false 表示只有本应用能绑定。
           BIND_VPN_SERVICE 由系统在用户授权后持有，本应用自身不声明该权限。
         -->
+        <!-- Resolves against the module namespace to
+             com.clashhalo.vpn.HaloVpnService (the Kotlin package). -->
         <service
-            android:name=".vpn.HaloVpnService"
+            android:name=".HaloVpnService"
             android:process=":vpn"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"

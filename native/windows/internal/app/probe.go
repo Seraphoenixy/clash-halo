@@ -78,10 +78,11 @@ const (
 // probeTunBypassEnabled gates binding measurement traffic to the physical
 // adapter while TUN owns the default route.
 //
-// The implementation and its tests exist; it stays off until the cost/benefit
-// review accepts it and the real-TUN verification is done. See
-// docs/tun-measurement-bypass.md.
-var probeTunBypassEnabled = false
+// It is enabled: with TUN active, unbound test traffic would run through the
+// current node and a dead node could look reachable. The variable stays
+// writable so tests can exercise the refusal path of a build that disables it.
+// See docs/tun-measurement-bypass.md.
+var probeTunBypassEnabled = true
 
 // SpeedMetric names, mirroring the client's SpeedMetric wire values.
 const (
@@ -204,7 +205,7 @@ func (a *App) runProbes(p speedParams, cancel chan struct{}) []ProbeResult {
 			return fillProbeFailure(p, metric, "probe_isolation",
 				"TUN 已启用，但无法确定物理网卡，测试未执行："+err.Error())
 		}
-		relay, err := startDNSRelay(e)
+		relay, err := startDoHRelay(e)
 		if err != nil {
 			return fillProbeFailure(p, metric, "probe_isolation",
 				"TUN 已启用，但无法建立直连 DNS，测试未执行："+err.Error())
@@ -283,6 +284,9 @@ func (a *App) runProbes(p speedParams, cancel chan struct{}) []ProbeResult {
 				results[j.index] = r
 				progressMu.Lock()
 				completed++
+				if a.sess != nil {
+					a.sess.recordSpeed(r)
+				}
 				a.emit("task.progress", map[string]any{
 					"taskId": p.TaskID,
 					"done":   completed,

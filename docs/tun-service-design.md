@@ -285,4 +285,5 @@ TUN 是否启用仍由 `halo-host` 决定。服务常驻的代价与边界：
 
 测速流量是否绕过 TUN 是另一个独立功能，评估与决定见
 [`docs/tun-measurement-bypass.md`](tun-measurement-bypass.md)：
-实现已完成，但默认关闭；未启用时 TUN 开启下的测速会被拒绝而不是经过 TUN 测量。
+实现已默认启用；TUN 开启时测速内核与原始探测绑定物理源地址，DNS 经 DoH 中继，
+不会经过 TUN 测量。

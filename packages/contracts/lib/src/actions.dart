@@ -23,6 +23,7 @@ class HaloAction {
   static const tunServiceInstall = 'tun.serviceInstall';
   static const tunServiceUninstall = 'tun.serviceUninstall';
   static const speedTestStart = 'speedtest.start';
+  static const speedTestForget = 'speedtest.forget';
   static const taskCancel = 'task.cancel';
   static const logTail = 'log.tail';
   static const eventSubscribe = 'event.subscribe';
@@ -36,6 +37,13 @@ class HaloAction {
   /// loopback-only and the host already owns the running config that names it.
   static const connectionsList = 'connections.list';
   static const connectionsClose = 'connections.close';
+
+  /// The host owns measurements and traffic for its whole process lifetime:
+  /// the UI can exit and be reopened while the proxy and tray keep running.
+  /// `session.get` returns both halves on connect; `traffic.get` is the light
+  /// two-second poll used by the overview.
+  static const sessionGet = 'session.get';
+  static const trafficGet = 'traffic.get';
 
   static const all = <String>{
     snapshotGet,
@@ -55,12 +63,15 @@ class HaloAction {
     tunServiceInstall,
     tunServiceUninstall,
     speedTestStart,
+    speedTestForget,
     taskCancel,
     logTail,
     eventSubscribe,
     trayPublish,
     connectionsList,
     connectionsClose,
+    sessionGet,
+    trafficGet,
   };
 }
 

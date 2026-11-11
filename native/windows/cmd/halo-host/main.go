@@ -105,6 +105,14 @@ func main() {
 	// what made the overview show a dash while the about panel showed a
 	// constant that had nothing to do with the file on disk.
 	a.SetCoreVersion(coreVersion)
+	// A previous process may have died after enabling TUN but before clearing
+	// the Windows proxy. Repair that before a browser starts using the stale
+	// endpoint; TUN traffic itself is unaffected.
+	a.ReconcileTunSystemProxy()
+	// The traffic statistics belong to the host process, not to whichever
+	// window happens to be open. Starting the clock here means the counters keep
+	// moving while the UI is closed and a reopened window reads the same totals.
+	a.StartSessionSampler()
 
 	descriptor, err := ipc.DescriptorForCurrentUser()
 	if err != nil {
@@ -595,14 +603,42 @@ func showMainWindow(base string) {
 	// first frame are only milliseconds apart), and launching a second copy would
 	// leave two windows connected to the same host. Give a starting instance a
 	// moment to create its window before deciding it is not there.
-	for i := 0; i < 6; i++ {
-		time.Sleep(250 * time.Millisecond)
-		if hwnd := findMainWindow(); hwnd != 0 {
-			_, _, _ = syscall.NewLazyDLL("user32.dll").NewProc("SetForegroundWindow").Call(hwnd)
-			return
+	//
+	// Only do that when a UI process actually exists. The old code waited the
+	// full 1.5 seconds on every cold open even though no process was starting,
+	// which was the largest fixed cost between the tray click and the window.
+	if uiProcessRunning() {
+		for i := 0; i < 6; i++ {
+			time.Sleep(250 * time.Millisecond)
+			if hwnd := findMainWindow(); hwnd != 0 {
+				_, _, _ = syscall.NewLazyDLL("user32.dll").NewProc("SetForegroundWindow").Call(hwnd)
+				return
+			}
 		}
 	}
 	launchUI(base)
+}
+
+// uiProcessRunning reports whether any clash-halo.exe process exists.
+//
+// The window is created about 20 ms after the process starts, so the wait in
+// showMainWindow only has to cover that gap. When there is no process at all
+// there is nothing to wait for, and launching immediately removes the fixed
+// 1.5-second delay from a cold tray click.
+func uiProcessRunning() bool {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(snapshot)
+	var entry windows.ProcessEntry32
+	entry.Size = uint32(unsafe.Sizeof(entry))
+	for err := windows.Process32First(snapshot, &entry); err == nil; err = windows.Process32Next(snapshot, &entry) {
+		if strings.EqualFold(windows.UTF16ToString(entry.ExeFile[:]), uiExecutable) {
+			return true
+		}
+	}
+	return false
 }
 
 // toggleMainWindow is the left-click action: show the window, or hide it when it

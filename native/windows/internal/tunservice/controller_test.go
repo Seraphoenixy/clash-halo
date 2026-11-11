@@ -72,6 +72,11 @@ func runFakeCore(args []string) {
 			"open existing adapter: Element not found.)")
 		os.Exit(1)
 	}
+	if os.Getenv("HALO_TEST_CORE_MODE") == "invalid-device" && adapter == "clash-halo" {
+		fmt.Fprintln(os.Stderr, "FATAL[0015] start service: start inbound: start inbound/tun[tun-in]: "+
+			"configure tun interface: The system cannot find the file specified.")
+		os.Exit(1)
+	}
 	if path := os.Getenv("HALO_TEST_CORE_MARKER"); path != "" {
 		_ = os.WriteFile(path, []byte(adapter), 0o600)
 	}
@@ -229,6 +234,26 @@ func TestControllerRetriesAdapterConflict(t *testing.T) {
 		}
 	}
 	if st := f.ctl.Status(); st.State != "failed" || st.PID != 0 {
+		t.Fatalf("status = %+v", st)
+	}
+}
+
+func TestControllerRetriesInvalidAdapterDevice(t *testing.T) {
+	f := newFixture(t)
+	t.Setenv("HALO_TEST_CORE_MODE", "invalid-device")
+	// Starting the runner rotates this log. Failure detection must read from
+	// the start of the new log, using this attempt's output only.
+	if err := os.WriteFile(filepath.Join(f.cfg.RunDir, "core.log"), make([]byte, coreLogLimit+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := f.writeConfig(t, "runtime.json", fakeTunConfig)
+	if err := f.ctl.Start(path, os.Getpid()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if got := strings.Join(f.attemptNames(t), ","); got != "clash-halo,clash-halo-1" {
+		t.Fatalf("attempts = %s", got)
+	}
+	if st := f.ctl.Status(); st.State != "running" || st.Adapter != "clash-halo-1" || st.PID == 0 {
 		t.Fatalf("status = %+v", st)
 	}
 }

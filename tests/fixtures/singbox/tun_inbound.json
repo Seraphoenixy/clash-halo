@@ -3,7 +3,8 @@
   "tag": "tun-in",
   "interface_name": "clash-halo",
   "address": [
-    "172.19.0.1/30"
+    "172.19.0.1/30",
+    "fdfe:dcba:9876::1/126"
   ],
   "mtu": 9000,
   "auto_route": true,

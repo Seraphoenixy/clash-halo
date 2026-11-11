@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'src/diagnostics/error_log.dart';
+import 'src/ipc/android_vpn.dart';
 import 'src/state/app_controller.dart';
 import 'src/theme.dart';
 import 'src/ui/app.dart';
@@ -37,7 +38,20 @@ String resolveDataDir() {
 }
 
 Future<void> main() async {
-  final dataDir = resolveDataDir();
+  WidgetsFlutterBinding.ensureInitialized();
+  // Android 的回退路径（Directory.systemTemp）落在 code_cache——应用更新即被
+  // 系统清空，数据库会随重装消失。改经平台通道取持久目录；桌面不受影响。
+  // 通道返回空串（平台实现缺失）时回退到 resolveDataDir，避免把数据库
+  // 建到文件系统根目录。
+  var androidDataDir = '';
+  if (Platform.isAndroid) {
+    try {
+      androidDataDir = await const AndroidVpnClient().dataDir();
+    } on Object {
+      androidDataDir = '';
+    }
+  }
+  final dataDir = androidDataDir.isNotEmpty ? androidDataDir : resolveDataDir();
   final errorLog = ErrorLog(dataDir);
   // Installed before anything else can throw. The default release error widget
   // is an empty grey box, which is indistinguishable from a window that never
@@ -136,7 +150,9 @@ class _HaloRootState extends State<HaloRoot> with WidgetsBindingObserver {
     // A missing handler (widget tests, an older runner) must never break the
     // window; the caption simply stays on the system theme.
     unawaited(
-      _windowTheme.invokeMethod<void>('setDark', dark).catchError((Object _) {}),
+      _windowTheme
+          .invokeMethod<void>('setDark', dark)
+          .catchError((Object _) {}),
     );
   }
 

@@ -24,3 +24,9 @@ plugins {
 }
 
 include(":app")
+
+// The VPN service lives outside apps/flutter so that native/android stays the
+// single home of the Android host-side code (see native/android/README.md).
+// Its manifest merges into the APK through the :app project dependency.
+include(":vpn")
+project(":vpn").projectDir = file("../../../native/android/vpn")

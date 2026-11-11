@@ -88,7 +88,9 @@ void main() {
         // with a password, a subscription URL with a token, and a node name that
         // an airport filled with an e-mail address.
         controller.saveImport(
-          importNodes('trojan://SuperSecretPw@api.secret-host.xyz:443#客服a@b.com'),
+          importNodes(
+            'trojan://SuperSecretPw@api.secret-host.xyz:443#客服a@b.com',
+          ),
         );
         controller.subscriptionRepo.upsert(
           const SubscriptionProfile(
@@ -120,11 +122,7 @@ void main() {
           '机场甲',
           'https://',
         ]) {
-          expect(
-            text.contains(secret),
-            isFalse,
-            reason: '诊断信息不得包含「$secret」',
-          );
+          expect(text.contains(secret), isFalse, reason: '诊断信息不得包含「$secret」');
         }
       } finally {
         await controller.dispose();
@@ -202,23 +200,20 @@ void main() {
       );
       for (final level in kLogLevels) {
         final built = RoutingSettings(logLevel: level).build(node);
-        expect(built.ok, isTrue, reason: built.issues.map((i) => i.message).join('；'));
-        final doc = built.config!.document;
         expect(
-          (doc['log'] as Map)['level'],
-          level,
-          reason: '保存的日志级别必须进入生成文档',
+          built.ok,
+          isTrue,
+          reason: built.issues.map((i) => i.message).join('；'),
         );
+        final doc = built.config!.document;
+        expect((doc['log'] as Map)['level'], level, reason: '保存的日志级别必须进入生成文档');
       }
     });
   });
 
   group('option tables', () {
     test('every log level the page offers is one the generator accepts', () {
-      expect(
-        kLogLevelChoices.map((c) => c.value).toSet(),
-        kLogLevels.toSet(),
-      );
+      expect(kLogLevelChoices.map((c) => c.value).toSet(), kLogLevels.toSet());
       expect(kLogLevels, contains('warn'));
       for (final choice in kLogLevelChoices) {
         expect(choice.label.trim(), isNotEmpty);
@@ -306,12 +301,37 @@ void main() {
 
       // The two new settings and the copy button must be reachable.
       expect(find.text('日志级别'), findsOneWidget);
+      expect(find.text('IPv6'), findsOneWidget);
       expect(find.text('测速并发'), findsOneWidget);
       // Nothing stored yet, so the dropdown shows the default, not 4.
       expect(find.byKey(const ValueKey('speed-concurrency-8')), findsOneWidget);
       expect(find.text('复制诊断信息'), findsOneWidget);
       // Read-only, never a control: the host owns the rotation size.
       expect(find.textContaining('2 MiB'), findsWidgets);
+    });
+
+    testWidgets('IPv6 defaults off and the toggle persists', (tester) async {
+      tester.view.physicalSize = const Size(1600, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildHaloTheme(Brightness.light),
+          home: Scaffold(
+            body: SizedBox(
+              width: 1200,
+              height: 2200,
+              child: SettingsPage(controller: controller),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(RoutingSettings.load(controller.settingsRepo).ipv6, isFalse);
+      await tester.tap(find.byKey(const ValueKey('ipv6')));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(RoutingSettings.load(controller.settingsRepo).ipv6, isTrue);
     });
 
     testWidgets('the about card carries versions, not build-status prose', (

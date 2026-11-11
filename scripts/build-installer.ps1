@@ -105,6 +105,7 @@ $payload = [ordered]@{
   'data\app.so'         = '界面快照'
   'data\icudtl.dat'     = 'ICU 数据'
   'data\flutter_assets\fonts\MaterialIcons-Regular.otf' = '图标字体'
+  'LICENSE'                                             = 'GPL-3.0-or-later 许可证'
 }
 $missing = @()
 foreach ($rel in $payload.Keys) {

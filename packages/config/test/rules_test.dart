@@ -132,12 +132,15 @@ void main() {
         return i;
       }
 
+      final sniffAt = indexOf((r) => r['action'] == 'sniff', 'sniff');
       final privateAt = indexOf((r) => r['ip_is_private'] == true, 'ip_is_private');
       final dnsAt = indexOf((r) => r['protocol'] == 'dns', 'protocol dns');
       final userAt = indexOf(
         (r) => (r['domain_suffix'] as List?)?.contains('example.com') ?? false,
         'user rule',
       );
+      expect(sniffAt, 0,
+          reason: 'sniffing must run before every matcher that needs a domain');
       expect(userAt, greaterThan(privateAt),
           reason: 'a user rule must not be able to shadow the LAN guard');
       expect(userAt, greaterThan(dnsAt),

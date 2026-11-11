@@ -288,7 +288,6 @@ func (c *Controller) alreadyRunning(hash string, hostPID int) bool {
 // launch starts one core and waits until its adapter exists or it fails.
 func (c *Controller) launch(stagedPath, adapter string, budget time.Duration) (*tunsup.Runner, error) {
 	logPath := filepath.Join(c.cfg.RunDir, "core.log")
-	before := fileSize(logPath)
 	p, err := tunsup.StartRunner(tunsup.RunnerOptions{
 		CorePath:   c.cfg.CorePath,
 		ConfigPath: stagedPath,
@@ -302,7 +301,7 @@ func (c *Controller) launch(stagedPath, adapter string, budget time.Duration) (*
 	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
 		if !p.Alive() {
-			output := tunsup.TailText(logPath, 8<<10, before)
+			output := tunsup.TailText(logPath, 8<<10, p.LogStart())
 			err := fmt.Errorf("TUN 适配器未能建立：%s", output)
 			if tunsup.IsAdapterConflict(output) {
 				p.Stop(c.grace)
@@ -320,7 +319,7 @@ func (c *Controller) launch(stagedPath, adapter string, budget time.Duration) (*
 		}
 		time.Sleep(readinessPoll)
 	}
-	output := tunsup.TailText(logPath, 8<<10, before)
+	output := tunsup.TailText(logPath, 8<<10, p.LogStart())
 	p.Stop(c.grace)
 	return nil, fmt.Errorf("等待 TUN 适配器超时（%s）：%s", budget, output)
 }
@@ -465,11 +464,4 @@ func writeFileAtomic(path string, body []byte, perm os.FileMode) error {
 func digest(body []byte) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
-}
-
-func fileSize(path string) int64 {
-	if st, err := os.Stat(path); err == nil {
-		return st.Size()
-	}
-	return 0
 }

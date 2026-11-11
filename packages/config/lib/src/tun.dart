@@ -30,7 +30,7 @@ const String kTunInboundTag = 'tun-in';
 /// Key order matters too: [applyTunInbound] callers compare serialised output,
 /// so the order here is the order of the fixture and of the host's struct.
 ///
-/// [adapterName] becomes `interface_name`, [address] the single-element
+/// [adapterName] becomes `interface_name`, [address] and [address6] become the
 /// `address` list, and [stack] must be one of `system`, `gvisor`, `mixed` —
 /// the pinned build carries the `with_gvisor` tag, so `mixed` is the default:
 /// it uses the Windows TCP stack for TCP and gvisor only for UDP, which is
@@ -38,21 +38,21 @@ const String kTunInboundTag = 'tun-in';
 Map<String, Object?> buildTunInbound({
   String adapterName = 'clash-halo',
   String address = '172.19.0.1/30',
+  String address6 = 'fdfe:dcba:9876::1/126',
   String stack = 'mixed',
   int mtu = 9000,
   bool autoRoute = true,
   bool strictRoute = true,
-}) =>
-    {
-      'type': 'tun',
-      'tag': kTunInboundTag,
-      'interface_name': adapterName,
-      'address': [address],
-      if (mtu != 0) 'mtu': mtu,
-      'auto_route': autoRoute,
-      'strict_route': strictRoute,
-      'stack': stack,
-    };
+}) => {
+  'type': 'tun',
+  'tag': kTunInboundTag,
+  'interface_name': adapterName,
+  'address': [address, if (address6.isNotEmpty) address6],
+  if (mtu != 0) 'mtu': mtu,
+  'auto_route': autoRoute,
+  'strict_route': strictRoute,
+  'stack': stack,
+};
 
 /// Returns a copy of [config] with exactly one `tun` inbound.
 ///
@@ -70,6 +70,7 @@ Map<String, Object?> applyTunInbound(
   Map<String, Object?> config, {
   String adapterName = 'clash-halo',
   String address = '172.19.0.1/30',
+  String address6 = 'fdfe:dcba:9876::1/126',
   String stack = 'mixed',
   int mtu = 9000,
   bool autoRoute = true,
@@ -87,6 +88,7 @@ Map<String, Object?> applyTunInbound(
   final tun = buildTunInbound(
     adapterName: adapterName,
     address: address,
+    address6: address6,
     stack: stack,
     mtu: mtu,
     autoRoute: autoRoute,
@@ -102,7 +104,8 @@ Map<String, Object?> applyTunInbound(
   result['inbounds'] = inbounds;
 
   final route = <String, Object?>{
-    if (result['route'] is Map) ...(result['route'] as Map).cast<String, Object?>(),
+    if (result['route'] is Map)
+      ...(result['route'] as Map).cast<String, Object?>(),
   };
   route['auto_detect_interface'] = true;
   result['route'] = route;

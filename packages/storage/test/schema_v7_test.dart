@@ -80,7 +80,9 @@ void main() {
   }
 
   test('a fresh database already has a nullable use_proxy', () {
-    expect(kSchemaVersion, 7);
+    // v7 semantics survive later migrations: a fresh install at any version
+    // from 7 on must still create the nullable column.
+    expect(kSchemaVersion, greaterThanOrEqualTo(7));
     expect(useProxyIsNotNull(), isFalse);
   });
 

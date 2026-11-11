@@ -102,6 +102,7 @@ ImportResult parseV2rayNProfiles(String body) {
   final nodes = <ProxyNode>[];
   final skipped = <ImportIssue>[];
   final failed = <ImportIssue>[];
+  final seen = <String>{};
 
   for (var i = 0; i < rows.length; i++) {
     final row = rows[i];
@@ -232,7 +233,20 @@ ImportResult parseV2rayNProfiles(String body) {
     // an empty fingerprint, and the repository's identity check treats that as
     // "no identity" — so a five-row export was written as a *single* row named
     // `n_`, with the last row winning and the rest silently lost.
-    nodes.add(withIdentity(node));
+    final stamped = withIdentity(node);
+    // Same connection twice under different remarks: report it like the
+    // share-link, Clash YAML and sing-box importers do, instead of letting it
+    // collapse silently at the database layer.
+    if (!seen.add(stamped.fingerprint)) {
+      skipped.add(ImportIssue(
+        kind: ImportFailureKind.duplicate,
+        message: '重复节点已跳过',
+        line: i + 1,
+        note: stamped.name,
+      ).withRaw(jsonEncode(item)));
+      continue;
+    }
+    nodes.add(stamped);
   }
 
   return ImportResult(

@@ -66,17 +66,18 @@ const (
 	ActionAutoLaunchSet = "autoLaunch.set"
 	// ActionCoreResumeSet toggles whether a core that was running last session
 	// is started again on the next host launch.
-	ActionCoreResumeSet  = "coreResume.set"
-	ActionTunSetEnabled  = "tun.setEnabled"
+	ActionCoreResumeSet = "coreResume.set"
+	ActionTunSetEnabled = "tun.setEnabled"
 	// The service is installed once and then used without UAC. These actions
 	// exist so the settings page can report and change that state.
 	ActionTunServiceStatus    = "tun.serviceStatus"
 	ActionTunServiceInstall   = "tun.serviceInstall"
 	ActionTunServiceUninstall = "tun.serviceUninstall"
-	ActionSpeedtest      = "speedtest.start"
-	ActionTaskCancel     = "task.cancel"
-	ActionLogTail        = "log.tail"
-	ActionEventSubscribe = "event.subscribe"
+	ActionSpeedtest           = "speedtest.start"
+	ActionSpeedtestForget     = "speedtest.forget"
+	ActionTaskCancel          = "task.cancel"
+	ActionLogTail             = "log.tail"
+	ActionEventSubscribe      = "event.subscribe"
 	// ActionTrayPublish lets the UI hand the tray a compact node catalogue.
 	// The host never owns the node database, so the tray menu's node list is a
 	// projection the UI keeps fresh rather than something the host reads.
@@ -85,6 +86,11 @@ const (
 	// controller is loopback-only and the UI has no HTTP stack pointed at it.
 	ActionConnectionsList  = "connections.list"
 	ActionConnectionsClose = "connections.close"
+	// The host owns the measurements and traffic statistics for the lifetime
+	// of its process. The UI is a view: closing the window must not end a speed
+	// test or reset the session counters.
+	ActionSessionGet = "session.get"
+	ActionTrafficGet = "traffic.get"
 )
 
 // Events pushed to subscribers.

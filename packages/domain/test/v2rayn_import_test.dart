@@ -262,6 +262,25 @@ void main() {
       expect(result.nodes.map((n) => n.id).toSet(), hasLength(3));
     });
 
+    test('the same connection under two remarks is reported as a duplicate', () {
+      // v2rayN exports repeat a connection with a new Remarks column. The other
+      // three importers report that as a skipped duplicate; this parser used to
+      // hand both rows to the database and let the id collision keep whichever
+      // came last, with no report at all.
+      final body = jsonEncode([
+        profile(type: 12, remarks: '第一条', password: 'pw-dup'),
+        profile(type: 12, remarks: '第二条', password: 'pw-dup'),
+      ]);
+
+      final result = parseV2rayNProfiles(body);
+      expect(result.nodes, hasLength(1));
+      expect(result.nodes.single.name, '第一条',
+          reason: 'the first occurrence is kept');
+      expect(result.duplicateCount, 1);
+      expect(result.skipped.single.kind, ImportFailureKind.duplicate);
+      expect(result.skipped.single.note, '第二条');
+    });
+
     test('HTTP/2 and HTTP/3 of the same host stay separate nodes', () {
       // Same address and credentials, different wire format. They used to hash
       // to one fingerprint, so importing both kept only one node.

@@ -157,6 +157,63 @@ void main() {
       }
     });
 
+    test('session.get keeps speed results after the window disconnects',
+        () async {
+      // The window is not the owner of a measurement. Run a batch over the real
+      // pipe, destroy the client (the host sees clients=0), reconnect as a new
+      // window, and require the result to still be there.
+      final events = <HaloEventMessage>[];
+      final sub = client.events.listen(events.add);
+      try {
+        await client.send(
+          HaloAction.eventSubscribe,
+          params: AppController.eventSubscribeParams,
+        );
+        final started = await client.send(
+          HaloAction.speedTestStart,
+          params: {
+            'taskId': 'live-session-test',
+            'nodeIds': ['live-session-node'],
+            'endpoints': ['http://127.0.0.1:1/never'],
+            'timeoutMs': 800,
+            'concurrency': 1,
+          },
+        );
+        expect(started.ok, isTrue, reason: started.error?.message);
+
+        final deadline = DateTime.now().add(const Duration(seconds: 10));
+        while (DateTime.now().isBefore(deadline) &&
+            !events.any((e) => e.name == HaloEvent.taskFinished)) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+        expect(
+          events.any((e) => e.name == HaloEvent.taskFinished),
+          isTrue,
+          reason: '批次未结束，无法验证结束后的结果保留',
+        );
+      } finally {
+        await sub.cancel();
+      }
+
+      await client.dispose();
+      client = HaloClient(
+        pipeName: pipeName,
+        pollInterval: const Duration(milliseconds: 10),
+      );
+      await client.connect();
+
+      final session = await client.send(HaloAction.sessionGet);
+      expect(session.ok, isTrue, reason: session.error?.message);
+      final speed = session.result!['speed'] as Map;
+      expect(speed['running'], isFalse);
+      final results = speed['results'] as List;
+      expect(
+        results.any((r) => r is Map && r['nodeId'] == 'live-session-node'),
+        isTrue,
+        reason: '界面重开后必须能读到界面关闭前完成的测速结果',
+      );
+    });
+
     test('applying a valid config starts the core and health-checks it',
         () async {
       final config = await _validConfig();
@@ -265,8 +322,8 @@ void main() {
   "inbounds": [
     {"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": $mixedPort}
   ],
-  "outbounds": [{"type": "direct", "tag": "direct"}],
-  "route": {"final": "direct"},
+  "outbounds": [{"type": "direct", "tag": "proxy"}],
+  "route": {"final": "proxy"},
   "experimental": {"clash_api": {"external_controller": "127.0.0.1:$apiPort"}}
 }
 ''';
@@ -278,10 +335,17 @@ void main() {
       expect(applied.ok, isTrue, reason: applied.error?.message);
 
       // A listener that accepts and never answers keeps the connection open for
-      // as long as the test needs it.
+      // as long as the test needs it. It sends response headers immediately so
+      // the host sees a proxy connection, and the body is written after the
+      // host's first sample (below) so the bytes land in a delta, not in the
+      // baseline.
       final sink = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       final held = <Socket>[];
-      final subscription = sink.listen(held.add);
+      final subscription = sink.listen((socket) {
+        held.add(socket);
+        socket.write('HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n');
+        unawaited(socket.flush());
+      });
 
       final probe = await Socket.connect(InternetAddress.loopbackIPv4, mixedPort);
       probe.write(
@@ -316,6 +380,78 @@ void main() {
       // sing-box reports nanoseconds (`...09.8402524+08:00`); if that did not
       // parse, every row's age would silently render as "—".
       expect(conn.parseStart(), isNotNull);
+
+      // The traffic clock belongs to the host. Wait until it has seen the proxy
+      // connection and taken a baseline, then send response bytes so the next
+      // delta is something the host can account for.
+      Map<String, Object?>? baseline;
+      final baselineDeadline = DateTime.now().add(const Duration(seconds: 12));
+      while (DateTime.now().isBefore(baselineDeadline)) {
+        final response = await client.send(HaloAction.trafficGet);
+        if (response.ok) {
+          final value = response.result ?? const <String, Object?>{};
+          final active = (value['activeConnections'] as num?)?.toInt() ?? 0;
+          final history = (value['history'] as List?)?.length ?? 0;
+          if (active > 0 && history > 0) {
+            baseline = value;
+            break;
+          }
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      }
+      expect(baseline, isNotNull, reason: '宿主 12 秒内没有采样到代理连接');
+
+      for (final socket in held) {
+        socket.add(List<int>.filled(65536, 0x41));
+        await socket.flush();
+      }
+
+      Map<String, Object?>? trafficBefore;
+      final trafficDeadline = DateTime.now().add(const Duration(seconds: 12));
+      while (DateTime.now().isBefore(trafficDeadline)) {
+        final response = await client.send(HaloAction.trafficGet);
+        if (response.ok) {
+          final value = response.result ?? const <String, Object?>{};
+          final moved =
+              ((value['uploadTotal'] as num?)?.toInt() ?? 0) +
+              ((value['downloadTotal'] as num?)?.toInt() ?? 0);
+          if (moved > 0) {
+            trafficBefore = value;
+            break;
+          }
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+      }
+      expect(
+        trafficBefore,
+        isNotNull,
+        reason: '宿主每 2 秒采样一次，12 秒内应当看到代理连接的累计字节',
+      );
+
+      await client.dispose();
+      await Future<void>.delayed(const Duration(seconds: 3));
+      client = HaloClient(
+        pipeName: pipeName,
+        pollInterval: const Duration(milliseconds: 10),
+      );
+      await client.connect();
+      final after = await client.send(HaloAction.trafficGet);
+      expect(after.ok, isTrue, reason: after.error?.message);
+      final afterValue = after.result ?? const <String, Object?>{};
+      expect(
+        (afterValue['uploadTotal'] as num?)?.toInt() ?? 0,
+        greaterThanOrEqualTo(
+          (trafficBefore!['uploadTotal'] as num?)?.toInt() ?? 0,
+        ),
+        reason: '界面重开后累计值不能比关闭前小',
+      );
+      expect(
+        (afterValue['history'] as List?)?.length ?? 0,
+        greaterThanOrEqualTo(
+          (trafficBefore['history'] as List?)?.length ?? 0,
+        ),
+        reason: '界面关闭期间宿主仍在采样，历史不应倒退',
+      );
 
       final closed = await client.send(
         HaloAction.connectionsClose,

@@ -6,6 +6,7 @@ import 'package:halo_contracts/halo_contracts.dart';
 import 'package:halo_storage/halo_storage.dart';
 
 import '../../../main.dart' show haloThemeMode;
+import '../../ipc/android_vpn.dart';
 import '../../ipc/halo_client.dart' show HostConnectionState;
 import '../../platform/win_file_dialog.dart';
 import '../../state/app_controller.dart';
@@ -101,7 +102,7 @@ DiagnosticsInput diagnosticsFor(
         c.storeReady &&
         c.connected &&
         (snap?.coreState.isRunning ?? false) &&
-        (snap?.activeNodeId?.isNotEmpty ?? false),
+        (c.activeNodeId?.isNotEmpty ?? false),
     speedTestConcurrency: concurrency,
     tableCounts: c.storeReady ? c.store.tableCounts() : const <String, int>{},
     localSubscriptionCount: c.storeReady
@@ -206,11 +207,12 @@ class _SettingsPageState extends State<SettingsPage> {
     if (password == null) return;
     setState(() => _busy = true);
     try {
+      final platform = Platform.isAndroid ? 'android' : 'windows';
       final payload = Backup.collect(
         c.store,
         nowMs: DateTime.now().millisecondsSinceEpoch,
-        appVersion: '0.1.0',
-        platform: 'windows',
+        appVersion: kSettingsAppVersion,
+        platform: platform,
       );
       final result = await Backup.exportSafe(
         payload,
@@ -219,9 +221,18 @@ class _SettingsPageState extends State<SettingsPage> {
       if (result.text == null) {
         throw StateError(result.error?.message ?? '备份失败');
       }
-      final path =
-          '${c.dataDir}${Platform.pathSeparator}'
+      final fileName =
           'halo-backup-${DateTime.now().millisecondsSinceEpoch}.chb';
+      if (Platform.isAndroid) {
+        final saved = await const AndroidVpnClient().exportBackup(
+          fileName: fileName,
+          content: result.text!,
+        );
+        if (saved == null) return;
+        if (mounted) showHaloToast(context, '备份已保存：${saved.name}');
+        return;
+      }
+      final path = '${c.dataDir}${Platform.pathSeparator}$fileName';
       await File(path).writeAsString(result.text!);
       if (mounted) showHaloToast(context, '备份已保存到 $path');
     } catch (e) {
@@ -238,15 +249,21 @@ class _SettingsPageState extends State<SettingsPage> {
   /// is recoverable without the user having prepared anything.
   Future<void> _restoreBackup() async {
     if (!c.storeReady) return;
-    final picked = await _pickBackupPath();
-    if (picked == null) return;
-
-    // Everything from here on is inside the try. Reading the file used to happen
-    // before it, so a missing/unreadable file threw into the void: the dialog
-    // closed, no message appeared, and the button looked broken.
+    // The picker and the file read are inside the try: a missing file or a
+    // failed document provider must produce a message, not a closed dialog
+    // with no explanation.
     setState(() => _busy = true);
     try {
-      final text = await File(picked).readAsString();
+      AndroidBackupPicked? androidPicked;
+      String? path;
+      if (Platform.isAndroid) {
+        androidPicked = await const AndroidVpnClient().importBackup();
+        if (androidPicked == null) return;
+      } else {
+        path = await _pickBackupPath();
+        if (path == null) return;
+      }
+      final text = androidPicked?.text ?? await File(path!).readAsString();
       final password = await _askPassword(encryptedHint: '如果备份设置了密码，请在此输入。');
       if (password == null) return;
       final inspected = await Backup.inspectAsync(
@@ -296,8 +313,8 @@ class _SettingsPageState extends State<SettingsPage> {
         c.store,
         preview,
         nowMs: DateTime.now().millisecondsSinceEpoch,
-        appVersion: '0.1.0',
-        platform: 'windows',
+        appVersion: kSettingsAppVersion,
+        platform: Platform.isAndroid ? 'android' : 'windows',
       );
       if (!result.applied) {
         throw StateError(result.error?.message ?? '恢复失败');
@@ -333,10 +350,7 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<String?> _pickBackupPath() async {
     String? path;
     try {
-      path = pickFileForOpen(
-        title: '选择要恢复的备份文件',
-        initialDirectory: c.dataDir,
-      );
+      path = pickFileForOpen(title: '选择要恢复的备份文件', initialDirectory: c.dataDir);
     } on WindowsFileDialogException catch (e) {
       // A dialog that failed to open is a real error, unlike a cancel; saying
       // only "找不到该备份文件" would blame the user's file for it.
@@ -399,10 +413,7 @@ class _SettingsPageState extends State<SettingsPage> {
     try {
       await c.setCoreResume(enabled);
       if (!mounted) return;
-      showHaloToast(
-        context,
-        enabled ? '以后启动时会自动恢复内核' : '以后启动时不再自动恢复内核',
-      );
+      showHaloToast(context, enabled ? '以后启动时会自动恢复内核' : '以后启动时不再自动恢复内核');
     } catch (e) {
       if (!mounted) return;
       showHaloToast(context, '设置失败：$e');
@@ -478,7 +489,7 @@ class _SettingsPageState extends State<SettingsPage> {
       c.storeReady &&
       c.connected &&
       (c.snapshot?.coreState.isRunning ?? false) &&
-      (c.snapshot?.activeNodeId?.isNotEmpty ?? false);
+      (c.activeNodeId?.isNotEmpty ?? false);
 
   Future<void> _setLogLevel(String level) async {
     final next = _routing.copyWith(logLevel: level);
@@ -497,6 +508,23 @@ class _SettingsPageState extends State<SettingsPage> {
     } catch (e) {
       if (!mounted) return;
       _snack('保存日志级别失败：$e');
+    }
+  }
+
+  Future<void> _setIpv6(bool value) async {
+    final next = _routing.copyWith(ipv6: value);
+    setState(() => _routing = next);
+    try {
+      await c.saveRouting(next);
+      if (!mounted) return;
+      _snack(
+        _appliedToCore
+            ? 'IPv6 已${value ? '启用' : '关闭'}，并已重新应用到内核'
+            : 'IPv6 已${value ? '启用' : '关闭'}，将在下次应用配置后生效',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _snack('保存 IPv6 设置失败：$e');
     }
   }
 
@@ -584,6 +612,18 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ),
                 const SizedBox(height: HaloMetrics.blockGap),
+                _SettingField(
+                  label: 'IPv6',
+                  hint: _routing.ipv6
+                      ? '允许应用解析并使用 IPv6。只有节点和当前网络都具备 IPv6 出口时才应开启。'
+                      : '默认关闭：TUN 不向应用返回 AAAA，只代理 IPv4，避免 IPv4-only 节点收到无法连接的 IPv6 流量。',
+                  trailing: HaloSwitch(
+                    key: const ValueKey('ipv6'),
+                    value: _routing.ipv6,
+                    onChanged: c.storeReady ? _setIpv6 : null,
+                  ),
+                ),
+                const SizedBox(height: HaloMetrics.rowGap),
                 _SettingField(
                   label: '测速并发',
                   hint:
@@ -728,19 +768,23 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                     // The tray menu already opens these directories; having the
                     // same two buttons here means a user who never opens the tray
-                    // can still find the logs and the database.
-                    OutlinedButton.icon(
-                      onPressed: () => _openDirectory(c.dataDir),
-                      icon: const Icon(Icons.folder_outlined, size: 15),
-                      label: const Text('打开数据目录'),
-                    ),
-                    OutlinedButton.icon(
-                      onPressed: () => _openDirectory(
-                        '${c.dataDir}${Platform.pathSeparator}logs',
+                    // can still find the logs and the database. Android has no
+                    // Explorer and its data directory is app-private, so the
+                    // buttons would be dead controls there.
+                    if (!Platform.isAndroid) ...[
+                      OutlinedButton.icon(
+                        onPressed: () => _openDirectory(c.dataDir),
+                        icon: const Icon(Icons.folder_outlined, size: 15),
+                        label: const Text('打开数据目录'),
                       ),
-                      icon: const Icon(Icons.description_outlined, size: 15),
-                      label: const Text('打开日志目录'),
-                    ),
+                      OutlinedButton.icon(
+                        onPressed: () => _openDirectory(
+                          '${c.dataDir}${Platform.pathSeparator}logs',
+                        ),
+                        icon: const Icon(Icons.description_outlined, size: 15),
+                        label: const Text('打开日志目录'),
+                      ),
+                    ],
                     OutlinedButton.icon(
                       onPressed: _copyDiagnostics,
                       icon: const Icon(Icons.copy_all_outlined, size: 15),
@@ -863,10 +907,7 @@ class _SettingField extends StatelessWidget {
           children: [
             SizedBox(
               width: 200,
-              child: Text(
-                label,
-                style: Theme.of(context).textTheme.titleSmall,
-              ),
+              child: Text(label, style: Theme.of(context).textTheme.titleSmall),
             ),
             const SizedBox(width: 16),
             trailing,

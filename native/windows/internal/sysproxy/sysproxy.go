@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	keyPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+	keyPath   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	valEnable = "ProxyEnable"
 	valServer = "ProxyServer"
 	valBypass = "ProxyOverride"
@@ -97,6 +97,32 @@ func (m *Manager) Apply(endpoint string) (previous State, applied State, err err
 	notifyChange()
 	applied = State{Enable: true, Server: endpoint, Bypass: bypass}
 	return prev, applied, nil
+}
+
+// DisableIfServer turns off an enabled proxy only when it still points at
+// server. It is used when a previous run left ProxyEnable=1 after the host
+// snapshot already said "system proxy off"; RestoreIfUnchanged refuses to touch
+// that state because it does not match the recorded applied value.
+func (m *Manager) DisableIfServer(server string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, err := m.Read()
+	if err != nil {
+		return false, err
+	}
+	if !cur.Enable || normalizeServer(cur.Server) != normalizeServer(server) {
+		return false, nil
+	}
+	k, err := registry.OpenKey(registry.CURRENT_USER, keyPath, registry.SET_VALUE)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = k.Close() }()
+	if err := k.SetDWordValue(valEnable, 0); err != nil {
+		return false, err
+	}
+	notifyChange()
+	return true, nil
 }
 
 // RestoreIfUnchanged rewrites [previous] only when the registry still contains

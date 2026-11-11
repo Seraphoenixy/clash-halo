@@ -11,6 +11,42 @@ import 'schema.dart';
 import 'local_profile.dart';
 import 'store.dart';
 
+/// A connection a batch did not store because its fingerprint is already
+/// owned — by another profile, or by an earlier entry of the same batch.
+class SkippedDuplicate {
+  const SkippedDuplicate({
+    required this.node,
+    required this.ownerProfileId,
+    this.sameBatch = false,
+  });
+
+  /// The incoming node that was skipped.
+  final ProxyNode node;
+
+  /// Profile id of the row that keeps this connection. Empty when unknown.
+  final String ownerProfileId;
+
+  /// True when the fingerprint first appeared earlier in the same batch, so
+  /// the owner is this write's own target profile rather than another one.
+  final bool sameBatch;
+}
+
+/// Outcome of a batched node write: rows actually stored plus the duplicate
+/// connections that were skipped. `stored.length` is the number of rows the
+/// batch left in the table, which is what a caller that reports counts should
+/// use.
+class NodeWriteResult {
+  const NodeWriteResult({
+    this.stored = const [],
+    this.skippedDuplicates = const [],
+  });
+
+  final List<ProxyNode> stored;
+  final List<SkippedDuplicate> skippedDuplicates;
+
+  bool get isEmpty => stored.isEmpty && skippedDuplicates.isEmpty;
+}
+
 /// Persistence boundary for proxy nodes.
 class NodeRepository {
   NodeRepository(this._store);
@@ -39,25 +75,48 @@ class NodeRepository {
     return rows.map(_rowToNode).toList();
   }
 
-  /// Inserts a node. Nodes are identity-unique: an insert that collides with
-  /// an existing fingerprint updates that row instead of creating a duplicate,
-  /// which is what keeps re-imports from doubling the list.
+  /// Inserts a node. Nodes are identity-unique across the whole database: an
+  /// insert whose fingerprint is already owned by the same profile updates
+  /// that row, and one owned by another profile is skipped.
   ///
-  /// Returns the stored node.
+  /// Returns the row that now backs this connection — the newly stored node,
+  /// or the existing owner when the insert was skipped.
   ProxyNode insert(ProxyNode node, {required int nowMs}) {
-    return insertAll([node], nowMs: nowMs).single;
+    final result = insertAll([node], nowMs: nowMs);
+    if (result.stored.isNotEmpty) return result.stored.single;
+    return byFingerprint(node.fingerprint) ?? node;
+  }
+
+  /// The row carrying [fingerprint], if any. Identity is global, so there is
+  /// at most one.
+  ProxyNode? byFingerprint(String fingerprint) {
+    if (fingerprint.isEmpty) return null;
+    final rows = _db.select(
+      'SELECT * FROM ${Tables.nodes} WHERE fingerprint = ?',
+      [fingerprint],
+    );
+    return rows.isEmpty ? null : _rowToNode(rows.first);
   }
 
   /// Inserts [nodes] in one transaction with one identity prefetch for the
   /// whole batch.
   ///
-  /// The per-node [insert] runs a fingerprint SELECT and its own implicit
-  /// commit per row, so pasting a 5000-node list paid ~10k statements and 5000
-  /// journal fsyncs on the UI isolate. Prefetching the (fingerprint, profile)
+  /// The per-node [insert] used to run a fingerprint SELECT and its own
+  /// implicit commit per row, so pasting a 5000-node list paid ~10k statements
+  /// and 5000 journal fsyncs on the UI isolate. Prefetching the identity
   /// collisions once and writing the batch inside a single savepoint turns
   /// that into one statement per node and one commit.
-  List<ProxyNode> insertAll(List<ProxyNode> nodes, {required int nowMs}) {
-    if (nodes.isEmpty) return const <ProxyNode>[];
+  ///
+  /// Identity is scoped to the whole database, not per profile: a connection
+  /// lives in exactly one row, owned by the profile that first imported it.
+  /// An incoming node whose fingerprint belongs to another profile is skipped
+  /// and reported in [NodeWriteResult.skippedDuplicates] instead of being
+  /// written as a second copy — this is what keeps overlapping aggregator
+  /// subscriptions from re-importing each other's nodes, and what makes a
+  /// user's cross-profile cleanup survive the next refresh. Within the batch
+  /// the first occurrence wins, matching the parser-level dedup reports.
+  NodeWriteResult insertAll(List<ProxyNode> nodes, {required int nowMs}) {
+    if (nodes.isEmpty) return const NodeWriteResult();
     return _store.transaction((db) {
       // A node with no profile is a node imported locally, and since v6 the
       // local list *is* a subscription. Adopting here rather than at each caller
@@ -77,34 +136,61 @@ class NodeRepository {
                     : node,
             ]
           : nodes;
-      // Group fingerprints by their target profile so one query per profile
-      // covers the whole batch.
-      final fingerprintsByProfile = <String?, Set<String>>{};
-      for (final node in incoming) {
-        if (node.fingerprint.isEmpty) continue;
-        fingerprintsByProfile
-            .putIfAbsent(node.profileId, () => <String>{})
-            .add(node.fingerprint);
-      }
-      final existing = <(String?, String), ProxyNode>{};
-      for (final entry in fingerprintsByProfile.entries) {
-        final fps = entry.value.toList();
+      // One query covers the whole batch: any row carrying one of these
+      // fingerprints — whatever profile owns it — decides the outcome.
+      final fingerprints = <String>{
+        for (final node in incoming)
+          if (node.fingerprint.isNotEmpty) node.fingerprint,
+      };
+      final existing = <String, ProxyNode>{};
+      if (fingerprints.isNotEmpty) {
+        final fps = fingerprints.toList();
         final placeholders = List.filled(fps.length, '?').join(', ');
         final rows = db.select(
           'SELECT * FROM ${Tables.nodes} '
-          'WHERE fingerprint IN ($placeholders) AND profile_id IS ?',
-          [...fps, entry.key],
+          'WHERE fingerprint IN ($placeholders)',
+          fps,
         );
         for (final row in rows) {
-          existing[(
-            row['profile_id'] as String?,
-            '${row['fingerprint']}',
-          )] = _rowToNode(row);
+          existing['${row['fingerprint']}'] = _rowToNode(row);
         }
       }
       final out = <ProxyNode>[];
+      final duplicates = <SkippedDuplicate>[];
+      final batchFirst = <String, ProxyNode>{};
       for (final node in incoming) {
-        final hit = existing[(node.profileId, node.fingerprint)];
+        if (node.fingerprint.isEmpty) {
+          // No identity to dedup on: write as-is, same as before fingerprints
+          // existed.
+          final stored = node.copyWith(
+            id: node.id.isEmpty ? 'n_' : node.id,
+            createdAtMs: node.createdAtMs == 0 ? nowMs : node.createdAtMs,
+            updatedAtMs: nowMs,
+          );
+          _write(stored);
+          out.add(stored);
+          continue;
+        }
+        final firstInBatch = batchFirst[node.fingerprint];
+        if (firstInBatch != null) {
+          duplicates.add(SkippedDuplicate(
+            node: node,
+            ownerProfileId: firstInBatch.profileId ?? '',
+            sameBatch: true,
+          ));
+          continue;
+        }
+        final hit = existing[node.fingerprint];
+        if (hit != null && hit.profileId != node.profileId) {
+          // Another profile already owns this connection. Writing it here
+          // would put the same node back into the list under a second name —
+          // the exact duplicate this repository exists to prevent.
+          duplicates.add(SkippedDuplicate(
+            node: node,
+            ownerProfileId: hit.profileId ?? '',
+          ));
+          continue;
+        }
         if (hit != null) {
           final stored = node.copyWith(
             id: hit.id,
@@ -113,6 +199,7 @@ class NodeRepository {
             updatedAtMs: nowMs,
           );
           _write(stored, replacingId: hit.id);
+          batchFirst[node.fingerprint] = stored;
           out.add(stored);
           continue;
         }
@@ -122,6 +209,7 @@ class NodeRepository {
           updatedAtMs: nowMs,
         );
         _write(stored);
+        batchFirst[node.fingerprint] = stored;
         out.add(stored);
       }
       if (adoptsLocal) {
@@ -131,7 +219,7 @@ class NodeRepository {
           [kLocalProfileId, kLocalProfileId],
         );
       }
-      return out;
+      return NodeWriteResult(stored: out, skippedDuplicates: duplicates);
     });
   }
 
@@ -182,10 +270,16 @@ class NodeRepository {
   /// subscription updates: a failed download never reaches this call, so the
   /// previous content survives.
   ///
+  /// The mirror stays scoped to connections this profile owns. A node whose
+  /// fingerprint another profile already owns is skipped and reported in
+  /// [NodeWriteResult.skippedDuplicates] rather than written as a second copy:
+  /// the aggregators users subscribe to republish each other's nodes, and
+  /// without the skip every refresh would put the duplicates back.
+  ///
   /// [keepNames] preserves locally renamed nodes by fingerprint, because
   /// subscription priority overrides local connection edits but a display
   /// rename is not a connection edit.
-  List<ProxyNode> replaceProfileNodes(
+  NodeWriteResult replaceProfileNodes(
     String profileId,
     List<ProxyNode> nodes, {
     required int nowMs,
@@ -200,10 +294,32 @@ class NodeRepository {
           ? {for (final n in nodesForProfile(profileId)) n.fingerprint: n}
           : const {};
       db.execute('DELETE FROM ${Tables.nodes} WHERE profile_id = ?', [profileId]);
+      // Prefetched after the delete, so every hit belongs to another profile:
+      // this profile's own rows are gone and cannot answer the lookup.
+      final fingerprints = <String>{
+        for (final node in nodes)
+          if (node.fingerprint.isNotEmpty) node.fingerprint,
+      };
+      final existing = <String, ProxyNode>{};
+      if (fingerprints.isNotEmpty) {
+        final fps = fingerprints.toList();
+        final placeholders = List.filled(fps.length, '?').join(', ');
+        final rows = db.select(
+          'SELECT * FROM ${Tables.nodes} WHERE fingerprint IN ($placeholders)',
+          fps,
+        );
+        for (final row in rows) {
+          existing['${row['fingerprint']}'] = _rowToNode(row);
+        }
+      }
       final out = <ProxyNode>[];
+      final duplicates = <SkippedDuplicate>[];
+      final batchFirst = <String>{};
       for (var i = 0; i < nodes.length; i++) {
         final node = nodes[i];
         final prior = keepNames ? previous[node.fingerprint] : null;
+        // Identity is stamped before the checks so the dedup decision uses
+        // the same fingerprint the row will carry.
         final prepared = withIdentity(node.copyWith(
           id: '',
           profileId: profileId,
@@ -212,11 +328,23 @@ class NodeRepository {
           createdAtMs: nowMs,
           updatedAtMs: nowMs,
           name: prior?.name ?? node.name,
-        )).copyWith(id: 'sub_${profileId}_${node.fingerprint}');
-        _write(prepared);
-        out.add(prepared);
+        ));
+        final fp = prepared.fingerprint;
+        final hit = existing[fp];
+        if (hit != null || batchFirst.contains(fp)) {
+          duplicates.add(SkippedDuplicate(
+            node: prepared,
+            ownerProfileId: hit?.profileId ?? profileId,
+            sameBatch: hit == null,
+          ));
+          continue;
+        }
+        batchFirst.add(fp);
+        final stored = prepared.copyWith(id: 'sub_${profileId}_$fp');
+        _write(stored);
+        out.add(stored);
       }
-      return out;
+      return NodeWriteResult(stored: out, skippedDuplicates: duplicates);
     });
   }
 

@@ -43,6 +43,7 @@ class RoutingSettings {
     this.dnsServer = 'https://223.5.5.5/dns-query',
     this.directDns = '223.5.5.5',
     this.fakeIp = false,
+    this.ipv6 = false,
     this.logLevel = 'warn',
     this.rules = const [],
   });
@@ -55,6 +56,11 @@ class RoutingSettings {
   final String dnsServer;
   final String directDns;
   final bool fakeIp;
+
+  /// Whether applications may receive IPv6 addresses. Off by default because
+  /// the common proxy node has no IPv6 egress; enabling it requires an
+  /// IPv6-capable node and network.
+  final bool ipv6;
 
   /// `log.level` of the generated document. Lower levels make the core write
   /// more, which is why `debug` is offered with a warning rather than as a
@@ -72,6 +78,7 @@ class RoutingSettings {
   static const _kDnsServer = 'routing.dnsServer';
   static const _kDirectDns = 'routing.directDns';
   static const _kFakeIp = 'routing.fakeIp';
+  static const _kIpv6 = 'routing.ipv6';
   static const _kLogLevel = 'routing.logLevel';
   static const _kRules = 'routing.rules';
 
@@ -83,11 +90,15 @@ class RoutingSettings {
       mode: RouteMode.fromWire(repo.raw(_kMode) ?? defaults.mode.wire),
       mixedPort: _int(repo.raw(_kMixed), defaults.mixedPort),
       clashApiPort: _int(repo.raw(_kClashApi), defaults.clashApiPort),
-      enableClashApi: _bool(repo.raw(_kClashApiEnabled), defaults.enableClashApi),
+      enableClashApi: _bool(
+        repo.raw(_kClashApiEnabled),
+        defaults.enableClashApi,
+      ),
       dnsEnabled: _bool(repo.raw(_kDnsEnabled), defaults.dnsEnabled),
       dnsServer: repo.raw(_kDnsServer) ?? defaults.dnsServer,
       directDns: repo.raw(_kDirectDns) ?? defaults.directDns,
       fakeIp: _bool(repo.raw(_kFakeIp), defaults.fakeIp),
+      ipv6: _bool(repo.raw(_kIpv6), defaults.ipv6),
       logLevel: normalizeLogLevel(repo.raw(_kLogLevel)),
       // A missing key is "never configured", not "no rules": the two must not
       // be conflated. An empty stored array is a user who deleted every rule,
@@ -156,6 +167,7 @@ class RoutingSettings {
     repo.setRaw(_kDnsServer, dnsServer);
     repo.setRaw(_kDirectDns, directDns);
     repo.setRaw(_kFakeIp, fakeIp ? '1' : '0');
+    repo.setRaw(_kIpv6, ipv6 ? '1' : '0');
     repo.setRaw(_kLogLevel, logLevel);
     repo.setRaw(_kRules, jsonEncode([for (final r in rules) r.toJson()]));
   }
@@ -169,6 +181,7 @@ class RoutingSettings {
     String? dnsServer,
     String? directDns,
     bool? fakeIp,
+    bool? ipv6,
     String? logLevel,
     List<RoutingRule>? rules,
   }) => RoutingSettings(
@@ -180,6 +193,7 @@ class RoutingSettings {
     dnsServer: dnsServer ?? this.dnsServer,
     directDns: directDns ?? this.directDns,
     fakeIp: fakeIp ?? this.fakeIp,
+    ipv6: ipv6 ?? this.ipv6,
     logLevel: logLevel ?? this.logLevel,
     rules: rules ?? this.rules,
   );
@@ -189,29 +203,47 @@ class RoutingSettings {
   /// TUN stays out of the document on purpose: the host composes its own
   /// runtime config (a copy plus a tun inbound) when the user enables TUN, and a
   /// tun inbound baked in here would be started unelevated and fail.
-  ConfigBuildResult build(ProxyNode node) => buildConfig(
-    ConfigRequest(
-      node: node,
-      mode: mode,
-      ports: InboundPorts(
-        mixed: mixedPort,
-        clashApi: clashApiPort,
-        enableClashApi: enableClashApi,
+  ///
+  /// The exception is Android (`withTun: true`): there is no host to compose
+  /// the inbound — the :vpn process's own VpnService is the TUN provider, so
+  /// the document must carry the tun inbound itself.
+  ConfigBuildResult build(ProxyNode node, {bool withTun = false}) {
+    final result = buildConfig(
+      ConfigRequest(
+        node: node,
+        mode: mode,
+        ports: InboundPorts(
+          mixed: mixedPort,
+          clashApi: clashApiPort,
+          enableClashApi: enableClashApi,
+        ),
+        dns: DnsSettings(
+          enabled: dnsEnabled,
+          server: dnsServer,
+          directServer: directDns,
+          fakeAddress: fakeIp,
+          ipv6: ipv6,
+        ),
+        tun: TunSettings(enabled: withTun),
+        // The generator has carried this parameter all along; nothing passed it,
+        // so every document said `warn` no matter what the user chose.
+        logLevel: logLevel,
+        rules: rules,
       ),
-      dns: DnsSettings(
-        enabled: dnsEnabled,
-        server: dnsServer,
-        directServer: directDns,
-        fakeAddress: fakeIp,
-      ),
-      tun: const TunSettings(enabled: false),
-      // The generator has carried this parameter all along; nothing passed it,
-      // so every document said `warn` no matter what the user chose.
-      logLevel: logLevel,
-      rules: rules,
-    ),
-    CoreCapabilities.singbox114,
-  );
+      CoreCapabilities.singbox114,
+    );
+    if (withTun && result.ok) {
+      // The generator emits `auto_detect_interface: !tun.enabled` — that is the
+      // Windows contract (the elevated service manages interfaces itself; see
+      // native/windows probe_egress). On Android the TUN provider is this very
+      // app's VpnService and the core MUST wrap its own outbound sockets with
+      // protect() — false makes them route back into the tunnel (measured
+      // 2026-11-07: tun TX flooding, zero responses). Force it true.
+      final route = result.config!.document['route'];
+      if (route is Map<Object?, Object?>) route['auto_detect_interface'] = true;
+    }
+    return result;
+  }
 
   static int _int(String? raw, int fallback) =>
       raw == null ? fallback : (int.tryParse(raw) ?? fallback);
@@ -232,6 +264,7 @@ class RoutingSettings {
       other.dnsServer == dnsServer &&
       other.directDns == directDns &&
       other.fakeIp == fakeIp &&
+      other.ipv6 == ipv6 &&
       other.logLevel == logLevel &&
       _sameRules(other.rules, rules);
 
@@ -256,6 +289,7 @@ class RoutingSettings {
     dnsServer,
     directDns,
     fakeIp,
+    ipv6,
     logLevel,
     Object.hashAll(rules),
   );

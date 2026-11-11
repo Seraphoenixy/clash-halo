@@ -2,9 +2,29 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:halo/src/state/app_controller.dart';
+import 'package:halo/src/state/session_state.dart';
 import 'package:halo/src/theme.dart';
 import 'package:halo/src/ui/pages/connections_page.dart';
 import 'package:halo_contracts/halo_contracts.dart';
+
+class _HostTrafficController extends AppController {
+  _HostTrafficController() : super(dataDir: 'unused');
+
+  @override
+  Future<TrafficSessionState> fetchTrafficSession() async =>
+      const TrafficSessionState(
+        upRate: 1024,
+        downRate: 2048,
+        uploadTotal: 1234,
+        downloadTotal: 5678,
+        peakUp: 4096,
+        peakDown: 8192,
+        history: [(1024, 2048), (1024, 2048)],
+        activeConnections: 1,
+        updatedAtMs: 1,
+        error: null,
+      );
+}
 
 /// The connection page is the only place that shows what the proxy is doing
 /// right now, so what it does with a snapshot matters: a blank column there is
@@ -79,6 +99,68 @@ void main() {
 
     // Totals in the subtitle, so the page states traffic as well as count.
     expect(find.textContaining('2 个活动连接'), findsOneWidget);
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('numeric headings and values share their right edge', (
+    tester,
+  ) async {
+    final snapshot = ConnectionsSnapshot(
+      controller: '127.0.0.1:9090',
+      connections: [
+        LiveConnection(
+          id: 'a',
+          host: 'example.com',
+          rule: 'DomainSuffix',
+          chains: const ['proxy'],
+          upload: 999 * 1024 * 1024,
+          download: 999 * 1024 * 1024,
+          start: DateTime.now()
+              .subtract(const Duration(seconds: 90))
+              .toIso8601String(),
+        ),
+      ],
+    );
+    await tester.pumpWidget(harness(controller(), () async => snapshot));
+    await tester.pump(const Duration(milliseconds: 50));
+    expect(tester.takeException(), isNull);
+
+    final heading = tester.getRect(find.text('流量').first);
+    final reading = tester.getRect(find.text('↑999.0 MB ↓999.0 MB').first);
+    expect(
+      (heading.right - reading.right).abs(),
+      lessThan(1.0),
+      reason: '流量表头与数值必须共用右边线',
+    );
+    expect(reading.width, greaterThan(80), reason: '流量不能被截断到只剩箭头');
+
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets('headline traffic uses the host session, not the page counter', (
+    tester,
+  ) async {
+    final host = _HostTrafficController();
+    addTearDown(host.dispose);
+    host.applySnapshotForTest(
+      const RuntimeSnapshot(stateVersion: 1, coreState: CoreState.running),
+      connected: true,
+    );
+    await tester.pumpWidget(harness(host, () async => sample()));
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(tester.takeException(), isNull);
+
+    // The host session says 1.0/2.0 KB/s with 1.2/5.5 KB totals. The page's
+    // own connection snapshot says 4.0/8.0 KB; a headline showing that would
+    // be a different statistic from the overview card.
+    expect(find.text('1.0 KB/s'), findsOneWidget);
+    expect(find.text('2.0 KB/s'), findsOneWidget);
+    expect(find.textContaining('代理流量'), findsOneWidget);
+    expect(find.textContaining('上行 1.2 KB'), findsOneWidget);
+    expect(find.textContaining('下行 5.5 KB'), findsOneWidget);
+    expect(find.textContaining('上行 4.0 KB'), findsNothing);
+    expect(find.textContaining('峰值 ↑4.0 KB/s ↓8.0 KB/s'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox());
   });

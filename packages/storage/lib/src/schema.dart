@@ -17,7 +17,7 @@ import 'package:sqlite3/sqlite3.dart';
 import 'local_profile.dart';
 
 /// Current schema version. Bump together with a new case in [applyMigrations].
-const int kSchemaVersion = 7;
+const int kSchemaVersion = 8;
 
 /// Table and index names, kept in one place for backup/restore and tests.
 abstract final class Tables {
@@ -86,7 +86,11 @@ void createSchema(Database db) {
       FOREIGN KEY (profile_id) REFERENCES ${Tables.subscriptions}(id) ON DELETE SET NULL
     )
   ''');
-  db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_fingerprint ON ${Tables.nodes}(fingerprint, COALESCE(profile_id, ''))");
+  // Node identity is global: one row per connection, regardless of which
+  // subscription imported it. Until v8 the index was scoped per profile
+  // `(fingerprint, COALESCE(profile_id, ''))`, which let every aggregator
+  // carry its own copy of the same free node.
+  db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_fingerprint ON ${Tables.nodes}(fingerprint)');
   db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_profile ON ${Tables.nodes}(profile_id)');
   db.execute('CREATE INDEX IF NOT EXISTS idx_nodes_sort ON ${Tables.nodes}(sort_index)');
   db.execute('''
@@ -240,6 +244,23 @@ void applyMigrations(Database db) {
         // explicitly rather than using `SELECT *`, so this migration keeps
         // working even if a later version adds a column.
         _relaxUseProxyNullability(db);
+      case 8:
+        // v8: one row per connection, globally.
+        //
+        // Until now identity was scoped per subscription: the index was
+        // `(fingerprint, COALESCE(profile_id, ''))`, so the same connection
+        // published by several free-node aggregators was stored once per
+        // profile and every list showed it again under yet another name.
+        // Deleting those copies by hand did not help — the next refresh of
+        // any owning profile re-created them. The repositories now enforce a
+        // single row per fingerprint, owned by the profile that first
+        // imported it, and skip re-imports that another profile already
+        // owns. This migration brings existing databases to the same shape:
+        // within each duplicate cluster the earliest row survives
+        // (`created_at`, then rowid), which is the same "first import wins"
+        // rule the write paths apply going forward. Re-runnable: an already
+        // deduplicated table has no clusters and only rebuilds the index.
+        _mergeDuplicateFingerprints(db);
       default:
         throw StateError('未知的迁移版本 $v');
     }
@@ -320,6 +341,45 @@ void _relaxUseProxyNullability(Database db) {
        SET use_proxy = NULL
      WHERE use_proxy = 0 AND proxy_url IS NULL
   ''');
+}
+
+/// Collapses every fingerprint cluster in [Tables.nodes] to its earliest row
+/// and rebuilds the identity index as globally unique.
+///
+/// The survivor keeps its own name and profile: no rewriting, no renaming —
+/// the other rows in the cluster are exact duplicates of the same connection
+/// and their names came from whichever aggregator published them last.
+/// References to the removed rows (the host's `activeNodeId`, per-node UI
+/// state) already tolerate a vanished id, which is the contract the runtime
+/// has always had for deleted nodes.
+void _mergeDuplicateFingerprints(Database db) {
+  final clusters = db.select(
+    'SELECT fingerprint FROM ${Tables.nodes} '
+    'GROUP BY fingerprint HAVING COUNT(*) > 1',
+  );
+  var removed = 0;
+  for (final row in clusters) {
+    final rows = db.select(
+      'SELECT id FROM ${Tables.nodes} WHERE fingerprint = ? '
+      'ORDER BY created_at ASC, rowid ASC',
+      ['${row['fingerprint']}'],
+    );
+    for (var i = 1; i < rows.length; i++) {
+      db.execute('DELETE FROM ${Tables.nodes} WHERE id = ?',
+          ['${rows[i]['id']}']);
+      removed++;
+    }
+  }
+  db.execute('DROP INDEX IF EXISTS idx_nodes_fingerprint');
+  db.execute(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_fingerprint '
+    'ON ${Tables.nodes}(fingerprint)',
+  );
+  if (removed > 0) {
+    // Recorded for diagnosability, same as v5's repair count: a user who
+    // notices their node list shrank should be able to learn why.
+    setMeta(db, SettingKeys.mergedDuplicateNodes, '$removed');
+  }
 }
 
 /// The v2rayN `EConfigType` numbers whose meaning the importer once got wrong.
@@ -425,4 +485,8 @@ abstract final class SettingKeys {
   /// stored v2rayN `configType` disagreed. Read once by the UI so the removal is
   /// explained rather than mysterious.
   static const repairedNodes = 'db.repairedNodes';
+
+  /// How many cross-profile duplicate rows migration v8 removed while
+  /// collapsing the node table to one row per connection. Diagnostic only.
+  static const mergedDuplicateNodes = 'db.mergedDuplicateNodes';
 }

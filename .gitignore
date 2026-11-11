@@ -53,3 +53,9 @@ __pycache__/
 # 生成物因此整体忽略（含 review/ 等子目录）。脚本会自己建目录，clone 后
 # 目录不存在是正常的。
 docs/images/
+
+# Android 移动内核库：从锁定的 sing-box v1.14.4 源码构建（native/android/README.md），
+# 79MB+ 级二进制不入库，与 prototype/bin 同理。libs/ 是解包后的 jar/aar，
+# jniLibs/ 是运行时 .so；两者都由 native/android/README.md 的构建步骤生成。
+native/android/vpn/libs/
+native/android/vpn/src/main/jniLibs/

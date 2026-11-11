@@ -10,6 +10,7 @@ import '../../state/home_cards.dart';
 import '../../state/throughput.dart';
 import '../../theme.dart';
 import '../app.dart';
+import '../overview_shared.dart';
 import '../shell.dart';
 import '../tun_card.dart';
 import '../widgets.dart';
@@ -74,7 +75,7 @@ class OverviewPage extends StatefulWidget {
 /// Below this the cards stack. Two 380px columns of half-width labels are worse
 /// than a longer page, and the breakpoint has to leave a pair of cards wide
 /// enough for the 216px mode selector plus its label.
-const double _twoColumnBreakpoint = 860;
+const double _twoColumnBreakpoint = HaloMetrics.overviewTwoColumnBreakpoint;
 
 class _OverviewPageState extends State<OverviewPage> {
   bool _busy = false;
@@ -88,22 +89,6 @@ class _OverviewPageState extends State<OverviewPage> {
   /// before the settings are readable; the load is retried on the next
   /// runtime tick instead of being silently skipped.
   bool _cardsLoaded = false;
-
-  final ThroughputMonitor _throughput = ThroughputMonitor(
-    historyLength: 40,
-    proxyOnly: true,
-  );
-  Timer? _trafficTimer;
-  (int, int)? _trafficCore;
-  bool _trafficPolling = false;
-
-  /// Bumped when the traffic poll produces new data, so the poll repaints
-  /// only the traffic card — the previous implementation called setState for
-  /// the whole page every two seconds while five of the six cards had not
-  /// changed.
-  final ValueNotifier<int> _trafficRevision = ValueNotifier<int>(0);
-
-  String? _trafficError;
 
   /// Exit information, fetched through the running node.
   ExitInfo? _exit;
@@ -153,9 +138,7 @@ class _OverviewPageState extends State<OverviewPage> {
 
   @override
   void dispose() {
-    _trafficTimer?.cancel();
     _speedSub?.cancel();
-    _trafficRevision.dispose();
     c.runtimeRevision.removeListener(_onRuntime);
     super.dispose();
   }
@@ -171,8 +154,7 @@ class _OverviewPageState extends State<OverviewPage> {
   /// need a running core, and neither may run when nothing is listening.
   void _onRuntime() {
     _ensureCards();
-    _syncTrafficPolling();
-    final activeId = c.snapshot?.activeNodeId;
+    final activeId = c.activeNodeId;
     if (activeId != _exitNodeId) {
       // The previous answer described another exit. Showing it under the new
       // node's name would be the same mistake as a stale latency next to a
@@ -194,46 +176,6 @@ class _OverviewPageState extends State<OverviewPage> {
 
   late final ExitInfoService _exitService =
       widget.exitService ?? ExitInfoService(proxyResolver: _proxyEndpoint);
-
-  void _syncTrafficPolling() {
-    // Polling a stopped core would answer with the host's "busy" error twice a
-    // second and paint an error on a card about a feature that is simply idle.
-    final snap = c.snapshot;
-    final core = _cards.isVisible(HomeCard.traffic) && _ready && snap != null
-        ? (snap.corePid, snap.tunPid)
-        : null;
-    if (core == _trafficCore) return;
-    _trafficCore = core;
-    _trafficTimer?.cancel();
-    _trafficTimer = null;
-    _throughput.reset();
-    _trafficError = null;
-    if (core != null) {
-      _trafficTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-        unawaited(_pollTraffic());
-      });
-      unawaited(_pollTraffic());
-    }
-  }
-
-  Future<void> _pollTraffic() async {
-    final timer = _trafficTimer;
-    if (timer == null || _trafficPolling) return;
-    _trafficPolling = true;
-    try {
-      final snapshot = await c.fetchConnections();
-      if (!mounted || timer != _trafficTimer) return;
-      _throughput.sample(snapshot, DateTime.now());
-      _trafficError = null;
-      _trafficRevision.value++;
-    } catch (error) {
-      if (!mounted || timer != _trafficTimer) return;
-      _trafficError = '$error';
-      _trafficRevision.value++;
-    } finally {
-      _trafficPolling = false;
-    }
-  }
 
   Future<void> _refreshExit({bool automatic = false}) async {
     if (_exitBusy) return;
@@ -277,7 +219,7 @@ class _OverviewPageState extends State<OverviewPage> {
   }
 
   Future<void> _testActiveNode() async {
-    final id = c.snapshot?.activeNodeId;
+    final id = c.activeNodeId;
     if (id == null || id.isEmpty) return;
     try {
       await c.startSpeedTest(nodeIds: [id]);
@@ -295,7 +237,6 @@ class _OverviewPageState extends State<OverviewPage> {
     if (next == null || !mounted) return;
     setState(() => _cards = next);
     if (c.storeReady) next.save(c.settingsRepo);
-    _syncTrafficPolling();
   }
 
   Future<void> _run(Future<void> Function() action) async {
@@ -426,19 +367,15 @@ class _OverviewPageState extends State<OverviewPage> {
                     ),
                   if (_cards.isVisible(HomeCard.traffic))
                     ValueListenableBuilder<int>(
-                      valueListenable: _trafficRevision,
+                      valueListenable: c.trafficRevision,
                       builder: (context, _, _) => _TrafficCard(
-                        throughput: _throughput,
-                        error: _trafficError,
+                        throughput: c.throughput,
+                        error: c.trafficError,
                         running: _ready,
                       ),
                     ),
                   if (_cards.isVisible(HomeCard.core))
-                    _CoreCard(
-                      controller: c,
-                      snapshot: snap,
-                      busy: _busy,
-                    ),
+                    _CoreCard(controller: c, snapshot: snap, busy: _busy),
                   if (_cards.isVisible(HomeCard.exit))
                     _ExitCard(
                       info: _exit,
@@ -523,11 +460,11 @@ class _OverviewPageState extends State<OverviewPage> {
                   );
                 }
 
-                final showBanner = _bannerVisible(c);
+                final showBanner = haloOverviewBannerVisible(c);
                 return ListView(
                   children: [
                     if (showBanner) ...[
-                      _NextStepCard(
+                      HaloNextStepCard(
                         controller: c,
                         onOpenPage: widget.onOpenPage,
                         onRunStep: widget.onRunStep,
@@ -566,137 +503,6 @@ List<Widget> _separated(List<Widget> children, Widget gap) {
     out.add(children[i]);
   }
   return out;
-}
-
-/// Whether the page has anything to say at the top.
-///
-/// Shared with [_NextStepCard] so the card and the gap before it agree: a
-/// `SizedBox.shrink` banner plus an unconditional gap would leave 12px of dead
-/// space at the top of an otherwise finished page.
-bool _bannerVisible(AppController controller) {
-  if (controller.nextStep != null) return true;
-  final snap = controller.snapshot;
-  if (snap == null) return false;
-  return snap.systemProxy.enabled || snap.tunState == TunState.enabled;
-}
-
-/// The one outstanding instruction, or a green "all set" line.
-///
-/// This is the page-local twin of the status bar hint: on the home page the user
-/// gets the full sentence plus the button, because that is where they land after
-/// a cold start.
-class _NextStepCard extends StatelessWidget {
-  const _NextStepCard({
-    required this.controller,
-    this.onOpenPage,
-    this.onRunStep,
-  });
-
-  final AppController controller;
-  final ValueChanged<HaloPage>? onOpenPage;
-  final Future<void> Function(NextStep step)? onRunStep;
-
-  @override
-  Widget build(BuildContext context) {
-    final step = controller.nextStep;
-    final p = HaloPalette.of(context);
-    final text = Theme.of(context).textTheme;
-    if (step == null) {
-      // Nothing outstanding. Only claim readiness when it is true.
-      //
-      // With the 流量还没有接管 step gone, "nothing outstanding" now also covers
-      // "core running but system proxy and TUN both off" — a state in which the
-      // green 代理已就绪 line would be a lie. In that case the page shows no
-      // banner at all: the 系统代理 and TUN cards directly below already carry
-      // 已关闭 and their own switches, which is the whole point of removing the
-      // banner.
-      final snap = controller.snapshot;
-      final intercepted =
-          (snap?.systemProxy.enabled ?? false) ||
-          ((snap?.tunState ?? TunState.disabled) == TunState.enabled);
-      if (!intercepted) return const SizedBox.shrink();
-      final success = HaloColors.adapt(HaloColors.success, p.isDark);
-      return SectionCard(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        child: Row(
-          children: [
-            Icon(Icons.check_circle_outline, size: 15, color: success),
-            const SizedBox(width: 8),
-            Text(
-              '代理已就绪，流量正走当前节点。',
-              style: text.bodyMedium?.copyWith(color: success),
-            ),
-          ],
-        ),
-      );
-    }
-    // Only `waiting` spins: it means something is actually in flight (the host
-    // is still booting). A stopped host will not change on its own, so showing
-    // a spinner there is what made a dead background service look like a
-    // forever-loading app.
-    final waiting = step.kind == NextStepKind.waiting;
-    final stopped = step.kind == NextStepKind.stopped;
-    final accent = HaloColors.adapt(
-      waiting
-          ? HaloColors.info
-          : stopped
-          ? HaloColors.danger
-          : HaloColors.warning,
-      p.isDark,
-    );
-    return SectionCard(
-      padding: const EdgeInsets.fromLTRB(12, 10, 10, 10),
-      child: Row(
-        children: [
-          Icon(
-            waiting
-                ? Icons.hourglass_top
-                : stopped
-                ? Icons.power_settings_new
-                : Icons.arrow_circle_right_outlined,
-            size: 16,
-            color: accent,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  step.title,
-                  style: text.bodyLarge?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: p.textPrimary,
-                  ),
-                ),
-                const SizedBox(height: HaloMetrics.hairGap),
-                Text(step.detail, style: text.bodySmall),
-              ],
-            ),
-          ),
-          const SizedBox(width: 10),
-          // No button and no spinner for a stopped host: there is no action to
-          // run (`onRunStep` would retry a dead pipe) and nothing in flight. The
-          // title/detail above already say what to do.
-          if (!waiting && !stopped)
-            FilledButton(
-              onPressed: onRunStep != null
-                  ? () => onRunStep!(step)
-                  : onOpenPage == null
-                  ? null
-                  : () => onOpenPage!(HaloPage.forStep(step.page)),
-              child: Text(step.actionLabel),
-            )
-          else if (waiting)
-            const SizedBox(
-              width: 14,
-              height: 14,
-              child: CircularProgressIndicator(strokeWidth: 2),
-            ),
-        ],
-      ),
-    );
-  }
 }
 
 class _CoreCard extends StatelessWidget {
@@ -740,7 +546,9 @@ class _CoreCard extends StatelessWidget {
             children: [
               if (!running)
                 FilledButton.icon(
-                  onPressed: enabled ? () => _guard(controller.startCore) : null,
+                  onPressed: enabled
+                      ? () => _guard(controller.startCore)
+                      : null,
                   icon: const Icon(Icons.play_arrow, size: 16),
                   label: const Text('启动内核'),
                 )
@@ -969,10 +777,7 @@ class _Facts extends StatelessWidget {
         Row(crossAxisAlignment: CrossAxisAlignment.start, children: cells),
       );
     }
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: rows,
-    );
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: rows);
   }
 }
 
@@ -1061,7 +866,7 @@ class _CurrentNodeCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final p = HaloPalette.of(context);
     final text = Theme.of(context).textTheme;
-    final id = snapshot.activeNodeId;
+    final id = controller.activeNodeId;
     ProxyNode? node;
     if (id != null && id.isNotEmpty) {
       for (final candidate in controller.loadNodes()) {

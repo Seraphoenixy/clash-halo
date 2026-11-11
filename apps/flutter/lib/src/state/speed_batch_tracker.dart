@@ -23,7 +23,8 @@ class SpeedBatchTracker {
     String action,
     Map<String, Object?> params,
     Duration timeout,
-  ) command;
+  )
+  command;
 
   final List<ProxyNode> Function() loadNodes;
 
@@ -70,26 +71,17 @@ class SpeedBatchTracker {
     reachability.remove(nodeId);
   }
 
-  /// Starts a batch and returns the host-assigned task id.
-  Future<String> start({
-    List<String> nodeIds = const [],
-    List<String> endpoints = const [],
-    SpeedMetric metric = SpeedMetric.proxyLatency,
-    String url = '',
-    int timeoutMs = 0,
-    int concurrency = 0,
-  }) async {
-    // Registering the id before the call keeps the first `task.progress` (which
-    // can arrive before the response does) attributed to this batch.
+  /// Prepares the pending set and clears only the metric this run will fill.
+  ///
+  /// Shared by the host-driven [start] and the Android local runner so both
+  /// paths keep the same "one batch at a time" state in the UI.
+  String _beginBatch({
+    required List<ProxyNode> selected,
+    required SpeedMetric metric,
+    required bool allNodes,
+  }) {
     final taskId = 'speed-$pid-${DateTime.now().microsecondsSinceEpoch}';
     _taskId = taskId;
-    final requestedIds = nodeIds.toSet();
-    final selected = loadNodes()
-        .where((n) => requestedIds.isEmpty || requestedIds.contains(n.id))
-        .toList();
-    // Only clear the collection this run will fill, and only for the nodes it
-    // will actually re-measure. Clearing everything made "test the selection"
-    // wipe the other nodes' readings.
     final scoped = {for (final node in selected) node.id};
     _pending
       ..clear()
@@ -97,8 +89,11 @@ class SpeedBatchTracker {
     _batchTotal = scoped.length;
     _batchMetric = metric;
 
-    void forgetScoped(void Function(String id) remove, void Function() clearAll) {
-      if (nodeIds.isEmpty) {
+    void forgetScoped(
+      void Function(String id) remove,
+      void Function() clearAll,
+    ) {
+      if (allNodes) {
         clearAll();
         return;
       }
@@ -112,17 +107,59 @@ class SpeedBatchTracker {
         forgetScoped(downloadResults.remove, downloadResults.clear);
       case SpeedMetric.tcp:
       case SpeedMetric.udp:
-        forgetScoped(
-          (id) => reachability[id]?.remove(metric),
-          () {
-            for (final entry in reachability.values) {
-              entry.remove(metric);
-            }
-          },
-        );
+        forgetScoped((id) => reachability[id]?.remove(metric), () {
+          for (final entry in reachability.values) {
+            entry.remove(metric);
+          }
+        });
       case SpeedMetric.proxyLatency:
         forgetScoped(results.remove, results.clear);
     }
+    return taskId;
+  }
+
+  /// Registers a local Android batch and returns its task id.
+  ///
+  /// The caller runs the probes and reports each terminal result through
+  /// [recordLocalResult]; this keeps the node page, watchdog and result maps on
+  /// the same contract as a host batch.
+  String beginLocalBatch({
+    required List<ProxyNode> selected,
+    required SpeedMetric metric,
+    bool allNodes = false,
+  }) => _beginBatch(selected: selected, metric: metric, allNodes: allNodes);
+
+  void recordLocalResult(SpeedResult result) {
+    _store(result);
+    _pending.remove(result.nodeId);
+    if (!_updates.isClosed) _updates.add(result);
+  }
+
+  void finishLocalBatch() {
+    _taskId = null;
+    clearBatch();
+  }
+
+  /// Starts a batch and returns the host-assigned task id.
+  Future<String> start({
+    List<String> nodeIds = const [],
+    List<String> endpoints = const [],
+    SpeedMetric metric = SpeedMetric.proxyLatency,
+    String url = '',
+    int timeoutMs = 0,
+    int concurrency = 0,
+  }) async {
+    // Registering the id before the call keeps the first `task.progress` (which
+    // can arrive before the response does) attributed to this batch.
+    final requestedIds = nodeIds.toSet();
+    final selected = loadNodes()
+        .where((n) => requestedIds.isEmpty || requestedIds.contains(n.id))
+        .toList();
+    final taskId = _beginBatch(
+      selected: selected,
+      metric: metric,
+      allNodes: nodeIds.isEmpty,
+    );
 
     final configs = <String>[];
     // A local copy: `endpoints` defaults to a const list, so appending to it
@@ -156,24 +193,22 @@ class SpeedBatchTracker {
 
     Map<String, Object?> result;
     try {
-      result = await command(
-        HaloAction.speedTestStart,
-        {
-          'taskId': taskId,
-          'metric': metric.wire,
-          'nodeIds': configs.isNotEmpty ? selected.map((n) => n.id).toList() : nodeIds,
-          if (configs.isNotEmpty) 'configs': configs,
-          if (targets.isNotEmpty) 'endpoints': targets,
-          if (url.isNotEmpty) 'url': url,
-          // Omitted when unset: an explicit 0 would still be a value the host
-          // has to special-case, and its per-metric default is what we want.
-          if (timeoutMs > 0) 'timeoutMs': timeoutMs,
-          'concurrency': _effectiveConcurrency(
-            metric == SpeedMetric.download && concurrency <= 0 ? 1 : concurrency,
-          ),
-        },
-        const Duration(seconds: 15),
-      );
+      result = await command(HaloAction.speedTestStart, {
+        'taskId': taskId,
+        'metric': metric.wire,
+        'nodeIds': configs.isNotEmpty
+            ? selected.map((n) => n.id).toList()
+            : nodeIds,
+        if (configs.isNotEmpty) 'configs': configs,
+        if (targets.isNotEmpty) 'endpoints': targets,
+        if (url.isNotEmpty) 'url': url,
+        // Omitted when unset: an explicit 0 would still be a value the host
+        // has to special-case, and its per-metric default is what we want.
+        if (timeoutMs > 0) 'timeoutMs': timeoutMs,
+        'concurrency': _effectiveConcurrency(
+          metric == SpeedMetric.download && concurrency <= 0 ? 1 : concurrency,
+        ),
+      }, const Duration(seconds: 15));
     } catch (_) {
       clearBatch();
       rethrow;
@@ -188,11 +223,9 @@ class SpeedBatchTracker {
   }
 
   Future<void> cancel(String taskId) async {
-    await command(
-      HaloAction.taskCancel,
-      {'taskId': taskId},
-      const Duration(seconds: 30),
-    );
+    await command(HaloAction.taskCancel, {
+      'taskId': taskId,
+    }, const Duration(seconds: 30));
     if (taskId == _taskId) {
       _taskId = null;
       clearBatch();
@@ -217,41 +250,8 @@ class SpeedBatchTracker {
         ? event.data['results'] as List
         : [event.data['result'] ?? event.data];
     for (final raw in results) {
-      if (raw is! Map || raw['nodeId'] is! String) continue;
-      // The host states which quantity it measured; guessing proxyLatency let a
-      // throughput reading be stored in the latency slot.
-      final metric = raw['metric'] is String
-          ? SpeedMetric.fromWire(raw['metric'] as String)
-          : SpeedMetric.proxyLatency;
-      final result = raw.containsKey('status')
-          ? SpeedResult.fromJson(
-              raw.cast<String, Object?>(),
-              // The event already told us what was measured; a payload that
-              // omits `metric` must not be re-guessed as TCP.
-              fallbackMetric: metric,
-            )
-          : SpeedResult(
-              nodeId: raw['nodeId'] as String,
-              metric: metric,
-              status: raw['ok'] == true
-                  ? SpeedStatus.ok
-                  : raw['errorCode'] == 'canceled'
-                      ? SpeedStatus.canceled
-                      : raw['errorCode'] == 'not_applicable'
-                          ? SpeedStatus.notApplicable
-                          // UDP silence is not a verdict: a filtered port and a
-                          // dead node look identical.
-                          : raw['errorCode'] == 'udp_unconfirmed'
-                              ? SpeedStatus.notApplicable
-                              : SpeedStatus.failed,
-              // A throughput reading is not a delay.
-              valueMs: metric == SpeedMetric.download
-                  ? null
-                  : (raw['latencyMs'] as num?)?.toInt(),
-              bytesPerSecond: (raw['downloadBps'] as num?)?.toInt(),
-              errorCode: raw['errorCode'] as String?,
-              errorMessage: raw['errorMsg'] as String?,
-            );
+      final result = _parseResult(raw);
+      if (result == null) continue;
       _store(result);
       _pending.remove(result.nodeId);
       if (!_updates.isClosed) _updates.add(result);
@@ -266,6 +266,78 @@ class SpeedBatchTracker {
       return true;
     }
     return false;
+  }
+
+  /// Replaces the local view with the host's session snapshot.
+  ///
+  /// The host outlives the window, so this is what makes a reopened node page
+  /// show the readings and the still-running batch that were produced while no
+  /// window existed. The host is authoritative here: a new host starts with an
+  /// empty session, and that empty snapshot must also clear this view.
+  void hydrateSession({
+    required bool running,
+    String? taskId,
+    SpeedMetric? metric,
+    required int total,
+    required List<String> pending,
+    required List<Map<String, Object?>> results,
+  }) {
+    this.results.clear();
+    downloadResults.clear();
+    reachability.clear();
+    for (final raw in results) {
+      final result = _parseResult(
+        raw,
+        fallbackMetric: metric ?? SpeedMetric.proxyLatency,
+      );
+      if (result != null) _store(result);
+    }
+    _taskId = running ? taskId : null;
+    _batchMetric = running ? metric : null;
+    _batchTotal = running ? total : 0;
+    _pending.clear();
+    if (running) _pending.addAll(pending);
+  }
+
+  SpeedResult? _parseResult(
+    Object? raw, {
+    SpeedMetric fallbackMetric = SpeedMetric.proxyLatency,
+  }) {
+    if (raw is! Map || raw['nodeId'] is! String) return null;
+    // The host states which quantity it measured; guessing proxyLatency let a
+    // throughput reading be stored in the latency slot.
+    final metric = raw['metric'] is String
+        ? SpeedMetric.fromWire(raw['metric'] as String)
+        : fallbackMetric;
+    return raw.containsKey('status')
+        ? SpeedResult.fromJson(
+            raw.cast<String, Object?>(),
+            // The event already told us what was measured; a payload that
+            // omits `metric` must not be re-guessed as TCP.
+            fallbackMetric: metric,
+          )
+        : SpeedResult(
+            nodeId: raw['nodeId'] as String,
+            metric: metric,
+            status: raw['ok'] == true
+                ? SpeedStatus.ok
+                : raw['errorCode'] == 'canceled'
+                ? SpeedStatus.canceled
+                : raw['errorCode'] == 'not_applicable'
+                ? SpeedStatus.notApplicable
+                // UDP silence is not a verdict: a filtered port and a
+                // dead node look identical.
+                : raw['errorCode'] == 'udp_unconfirmed'
+                ? SpeedStatus.notApplicable
+                : SpeedStatus.failed,
+            // A throughput reading is not a delay.
+            valueMs: metric == SpeedMetric.download
+                ? null
+                : (raw['latencyMs'] as num?)?.toInt(),
+            bytesPerSecond: (raw['downloadBps'] as num?)?.toInt(),
+            errorCode: raw['errorCode'] as String?,
+            errorMessage: raw['errorMsg'] as String?,
+          );
   }
 
   void clearBatch() {

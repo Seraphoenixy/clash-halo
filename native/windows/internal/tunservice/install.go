@@ -31,11 +31,10 @@ const (
 // never installed and cannot install.
 var coreRuntimeFiles = []string{cronetDLLName}
 
-// CoreRuntimeVersion identifies what stageCoreRuntime puts beside the core.
-// It is reported by `ping` so a host talking to a service installed by an older
-// build can tell that the companion files are missing and refresh the install.
-// Bump it whenever coreRuntimeFiles changes.
-const CoreRuntimeVersion = 1
+// CoreRuntimeVersion identifies the protected TUN runtime: version 1 added
+// the companion DLL, and version 2 adds recovery from an invalid Wintun device.
+// The host uses it to refresh an older installation even if the core matches.
+const CoreRuntimeVersion = 2
 
 // stageCoreRuntime copies the core's companion files into the protected
 // directory, replacing older copies so an upgrade cannot pair a new core with a

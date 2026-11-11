@@ -122,13 +122,16 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
             _preview = null;
           });
         }
-        if (mounted && (result.partial || result.duplicateCount > 0)) {
+        if (mounted &&
+            (result.partial ||
+                result.duplicateCount > 0 ||
+                result.crossDuplicateCount > 0)) {
           // The usable nodes are already stored; saying how many were left out
           // — and how many were simply repeats — keeps "订阅里怎么少了几个"
           // from becoming a mystery.
           _snack(
             '已导入 ${result.imported} 个节点，'
-            '${_importTally(unsupported: result.failed, kinds: result.failureKinds, duplicates: result.duplicateCount)}',
+            '${_importTally(unsupported: result.failed, kinds: result.failureKinds, duplicates: result.duplicateCount, crossDuplicates: result.crossDuplicateCount)}',
             duration: HaloToastDuration.detail,
             action: SnackBarAction(
               label: '查看',
@@ -138,6 +141,8 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
                 total: result.failed,
                 duplicates: result.duplicateCount,
                 duplicateSamples: result.skippedSamples,
+                crossDuplicates: result.crossDuplicateCount,
+                crossSamples: result.crossDuplicates,
               ),
             ),
           );
@@ -160,7 +165,7 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
     if (preview == null || preview.isEmpty) return;
     setState(() => _busy = true);
     try {
-      final total = c.saveImport(preview, source: _previewSource);
+      final (:total, :duplicates) = c.saveImport(preview, source: _previewSource);
       // Deliberately no subscription record here.
       //
       // This path only ever handles pasted content (a URL is imported by
@@ -171,7 +176,14 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
       // fail once a minute and mark themselves broken. Pasted nodes are local
       // nodes; a group only exists when a real URL does.
       if (mounted) {
-        showHaloToast(context, '已导入 ${preview.importedCount} 个节点，现有 $total 个');
+        // "已导入" says what landed; the skips say why the two numbers can
+        // disagree when the paste overlaps a subscription the user already
+        // has — the connection exists once and this write did not duplicate it.
+        showHaloToast(
+          context,
+          '已导入 ${preview.importedCount} 个节点，现有 $total 个'
+          '${duplicates.isEmpty ? '' : '，${duplicates.length} 条已存在，未重复添加'}',
+        );
       }
       setState(() {
         _input.clear();
@@ -216,10 +228,12 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
     var direct = 0;
     var unsupported = 0;
     var duplicates = 0;
+    var crossDuplicates = 0;
     final kinds = <String, int>{};
     final skippedKinds = <String, int>{};
     final samples = <ImportIssue>[];
     final skippedSamples = <ImportIssue>[];
+    final crossSamples = <ImportIssue>[];
     SubscriptionProfile? firstFailure;
     String? firstFailureError;
     for (final profile in targets) {
@@ -251,6 +265,12 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
           }
           skippedSamples.addAll(result.skippedSamples);
         }
+        // Connections another subscription already owns. Not a failure and not
+        // a repeat inside this body: the pool simply keeps one copy.
+        if (result.crossDuplicateCount > 0) {
+          crossDuplicates += result.crossDuplicateCount;
+          crossSamples.addAll(result.crossDuplicates);
+        }
         if (result.viaProxy) {
           proxied++;
         } else {
@@ -275,9 +295,9 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
     }
     if (single) {
       // A single row that updated but left entries out still needs to say so.
-      if (unsupported > 0 || duplicates > 0) {
+      if (unsupported > 0 || duplicates > 0 || crossDuplicates > 0) {
         _snack(
-          '已更新，${_importTally(unsupported: unsupported, kinds: kinds, duplicates: duplicates)}',
+          '已更新，${_importTally(unsupported: unsupported, kinds: kinds, duplicates: duplicates, crossDuplicates: crossDuplicates)}',
           duration: HaloToastDuration.detail,
           action: SnackBarAction(
             label: '查看',
@@ -287,6 +307,8 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
               total: unsupported,
               duplicates: duplicates,
               duplicateSamples: skippedSamples,
+              crossDuplicates: crossDuplicates,
+              crossSamples: crossSamples,
             ),
           ),
         );
@@ -302,6 +324,7 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
       if (unsupported > 0)
         '未导入 $unsupported 条（${describeImportFailures(kinds)}）',
       if (duplicates > 0) '重复 $duplicates 条',
+      if (crossDuplicates > 0) '跨订阅重复 $crossDuplicates 条',
     ];
     final notice = skipped > 0
         ? '更新完成：${parts.join('，')}，跳过 $skipped 个非远程记录'
@@ -315,7 +338,7 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
       // Two different questions can be pending here, and they are answered in
       // different dialogs: which entries were left out, or why a download
       // failed. The count is the more common one, so it owns the action.
-      action: unsupported > 0 || duplicates > 0
+      action: unsupported > 0 || duplicates > 0 || crossDuplicates > 0
           ? SnackBarAction(
               label: '查看',
               onPressed: () => _showImportFailures(
@@ -324,6 +347,8 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
                 total: unsupported,
                 duplicates: duplicates,
                 duplicateSamples: skippedSamples,
+                crossDuplicates: crossDuplicates,
+                crossSamples: crossSamples,
               ),
             )
           : firstFailure == null
@@ -590,11 +615,13 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
     required int unsupported,
     required Map<String, int> kinds,
     required int duplicates,
+    int crossDuplicates = 0,
   }) {
     final parts = <String>[
       if (unsupported > 0)
         '未导入 $unsupported 条（${describeImportFailures(kinds)}）',
       if (duplicates > 0) '重复 $duplicates 条',
+      if (crossDuplicates > 0) '跨订阅重复 $crossDuplicates 条',
     ];
     return parts.join('，');
   }
@@ -611,9 +638,12 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
     required int total,
     int duplicates = 0,
     List<ImportIssue> duplicateSamples = const [],
+    int crossDuplicates = 0,
+    List<ImportIssue> crossSamples = const [],
   }) {
     final theme = Theme.of(context);
     final breakdown = describeImportFailures(kinds, maxKinds: 8);
+    final allSamples = [...samples, ...duplicateSamples, ...crossSamples];
     return showDialog<void>(
       context: context,
       builder: (context) => AlertDialog(
@@ -624,13 +654,18 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                breakdown.isEmpty ? '共 $total 条' : '共 $total 条：$breakdown',
-              ),
+              Text(breakdown.isEmpty ? '共 $total 条' : '共 $total 条：$breakdown'),
               if (duplicates > 0) ...[
                 const SizedBox(height: 4),
                 Text(
                   '另有 $duplicates 条重复：同一份订阅里出现了多次，已保留第一条。',
+                  style: theme.textTheme.bodySmall,
+                ),
+              ],
+              if (crossDuplicates > 0) ...[
+                const SizedBox(height: 4),
+                Text(
+                  '另有 $crossDuplicates 条连接已由其他订阅提供，节点池里只保留一份。',
                   style: theme.textTheme.bodySmall,
                 ),
               ],
@@ -641,22 +676,17 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
                 style: theme.textTheme.bodySmall,
               ),
               const SizedBox(height: HaloMetrics.blockGap),
-              if (samples.isEmpty && duplicateSamples.isEmpty)
-                Text(
-                  '这次没有留下明细：只有总数，无法逐条查看。',
-                  style: theme.textTheme.bodySmall,
-                )
+              if (allSamples.isEmpty)
+                Text('这次没有留下明细：只有总数，无法逐条查看。', style: theme.textTheme.bodySmall)
               else
                 Flexible(
                   child: ListView.separated(
                     shrinkWrap: true,
-                    itemCount: samples.length + duplicateSamples.length,
+                    itemCount: allSamples.length,
                     separatorBuilder: (_, _) => const Divider(height: 1),
                     itemBuilder: (context, index) => _failureRow(
                       context,
-                      index < samples.length
-                          ? samples[index]
-                          : duplicateSamples[index - samples.length],
+                      allSamples[index],
                     ),
                   ),
                 ),
@@ -1425,7 +1455,7 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
     int nodeCount,
     int remoteCount,
   ) {
-    final activeId = c.snapshot?.activeNodeId;
+    final activeId = c.activeNodeId;
     final hasActiveNode = activeId != null && activeId.isNotEmpty;
     return [
       OutlinedButton.icon(
@@ -1477,7 +1507,8 @@ class _SubscriptionsPageState extends State<SubscriptionsPage> {
             key: const ValueKey('sub-update-all'),
             onPressed:
                 c.connected && !_busy && _updating.isEmpty && remoteCount > 0
-                ? () => _updateProfiles(profiles.where(isRemoteProfile).toList())
+                ? () =>
+                      _updateProfiles(profiles.where(isRemoteProfile).toList())
                 : null,
             icon: const Icon(Icons.refresh, size: 15),
             label: const Text('全部更新'),
@@ -1779,17 +1810,17 @@ class _ProfileRow extends StatelessWidget {
                 '更新：${profile.useProxyFor(profile.url) ? '经代理' : '直连'}'
                 '${profile.useProxy == null ? '（自动）' : ''}',
             child: TextButton.icon(
-            key: ValueKey('sub-update-${profile.id}'),
-            onPressed: onUpdate,
-            icon: updating
-                ? const SizedBox(
-                    width: 12,
-                    height: 12,
-                    child: CircularProgressIndicator(strokeWidth: 1.6),
-                  )
-                : const Icon(Icons.refresh, size: 15),
-            label: Text(updating ? '更新中' : '更新'),
-            style: _compactTextButton,
+              key: ValueKey('sub-update-${profile.id}'),
+              onPressed: onUpdate,
+              icon: updating
+                  ? const SizedBox(
+                      width: 12,
+                      height: 12,
+                      child: CircularProgressIndicator(strokeWidth: 1.6),
+                    )
+                  : const Icon(Icons.refresh, size: 15),
+              label: Text(updating ? '更新中' : '更新'),
+              style: _compactTextButton,
             ),
           ),
           IconButton(

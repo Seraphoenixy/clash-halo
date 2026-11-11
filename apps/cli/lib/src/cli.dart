@@ -597,12 +597,13 @@ class Cli {
     }
     return _withStore(parsed, (session) {
       final now = DateTime.now().millisecondsSinceEpoch;
-      final stored = session.nodes.insertAll(result.nodes, nowMs: now);
+      final written = session.nodes.insertAll(result.nodes, nowMs: now);
       final name = parsed.values['name']?.trim();
-      out('已导入 ${stored.length} 个节点'
+      out('已导入 ${written.stored.length} 个节点'
           '${name == null || name.isEmpty ? '' : '（$name）'}'
           '${result.failed.isEmpty ? '' : '，${result.failed.length} 条未导入：${describeImportFailures(result.failureKinds)}'}'
-          '${result.duplicateCount > 0 ? '，${result.duplicateCount} 条重复' : ''}');
+          '${result.duplicateCount > 0 ? '，${result.duplicateCount} 条重复' : ''}'
+          '${written.skippedDuplicates.isEmpty ? '' : '，跨订阅重复 ${written.skippedDuplicates.length} 条（节点池只保留一份）'}');
       if (result.skipped.isNotEmpty) {
         out('跳过 ${result.skipped.length} 条：${result.skipped.first.message}');
       }
@@ -674,20 +675,26 @@ class Cli {
         throw SubscriptionFetchException('解析失败（$why），已保留旧数据');
       }
       final now = DateTime.now().millisecondsSinceEpoch;
+      NodeWriteResult replaced = const NodeWriteResult();
       session.store.transaction((_) {
-        session.nodes.replaceProfileNodes(profile.id, result.nodes, nowMs: now);
+        replaced = session.nodes
+            .replaceProfileNodes(profile.id, result.nodes, nowMs: now);
+        // The row count is what this profile owns after the replace, not what
+        // the source listed: connections another subscription already owns are
+        // skipped, and the source count would disagree with the node list.
         session.subscriptions.upsert(profile.copyWith(
           lastUpdatedAtMs: now,
           lastError: download.usedFallback
               ? '当天文件尚未发布，已使用 ${download.fallbackDays} 天前的文件'
               : null,
           clearLastError: !download.usedFallback,
-          nodeCount: result.nodes.length,
+          nodeCount: replaced.stored.length,
         ));
       });
       out('$label已导入 ${result.nodes.length} 个节点'
           '${result.failed.isEmpty ? '' : '，${result.failed.length} 条未导入：${describeImportFailures(result.failureKinds)}'}'
-          '${result.duplicateCount > 0 ? '，${result.duplicateCount} 条重复' : ''}');
+          '${result.duplicateCount > 0 ? '，${result.duplicateCount} 条重复' : ''}'
+          '${replaced.skippedDuplicates.isEmpty ? '' : '，跨订阅重复 ${replaced.skippedDuplicates.length} 条'}');
       return 0;
     } catch (error) {
       session.subscriptions.markFailed(

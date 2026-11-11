@@ -52,7 +52,7 @@ halo-host.exe（托盘后台，普通权限）
 | `packages/config` | sing-box 配置生成与能力检查 |
 | `packages/storage` | SQLite schema、仓储、备份 |
 | `native/windows` | Go 宿主、TUN 服务、IPC 与内核管理 |
-| `native/android` | Android VPN 进程边界（脚手架，未验证） |
+| `native/android` | Android VPN 实现（`:vpn` 进程、libbox、状态与启停） |
 | `installer` | NSIS 安装脚本 |
 | `scripts` | 构建、测试、签名、截图等脚本 |
 | `docs` | 架构、契约、设计规范、验证记录 |
@@ -99,6 +99,16 @@ pwsh -NoProfile -File scripts/build-windows.ps1 -DartOnly
 构建完成后 `build\windows-x64` 包含界面、宿主、TUN 服务、内核与运行库。构建脚本
 会校验本次产出的 `data/app.so`、图标字体与 `NativeAssetsManifest.json`（SQLite
 映射），避免出现“构建成功但启动后数据库打不开”的产物。
+
+### Android
+
+```powershell
+pwsh -NoProfile -File scripts/build-android.ps1
+```
+
+产物：`build\android-arm64\app-release.apk`，与 `build\windows-x64` 同级。
+脚本只做工具链解析、`flutter build apk` 与产物收集；Flutter 的中间目录仍是
+`apps/flutter/build/`。
 
 ### 安装包
 
@@ -174,8 +184,12 @@ go test -count=1 -timeout 10m ./...
 
 - TUN 服务的真实 SCM 安装/卸载、真实 wintun 适配器与路由清理仍需在管理员机器上
   验收；当前验证范围见 `docs/验证记录.md`。
-- TUN 开启时的测速绕过已实现但默认关闭，需要真实 TUN 端到端验证后才能启用。
-- Android 端只有进程与权限边界，不含可用的 VPN 实现，不能据此宣称 Android 可用。
+- TUN 开启时的测速绕过已默认启用：测速内核与原始探测绑定物理源地址，DNS 经
+  DoH 中继；真实 TUN 下已验证延迟、下载与原始 TCP。节点协议的完整端到端与
+  多网卡选择仍需继续验证，详见 `docs/tun-measurement-bypass.md`。
+- Android 端的订阅导入、节点启用、VPN 授权、真实流量与本地测速已经验证；测速期间会
+  短暂断开或切换 VPN，后台存活、网络切换恢复与按应用分流仍未验证，详见
+  `native/android/README.md`。
 - 仓库未包含代码签名证书；`scripts/sign-windows.ps1` 只提供签名流程，实际证书
   由发布者提供。
 - `packages/domain/test/fixtures/tls/` 中的自签名证书与私钥仅用于本机测试，
@@ -183,5 +197,10 @@ go test -count=1 -timeout 10m ./...
 
 ## 许可
 
-仓库当前未包含 `LICENSE` 文件。公开发布或分发前需要确定许可证；在补充许可证
-之前，默认保留所有权利。
+本项目以 **GPL-3.0-or-later** 发布，完整许可证文本见 [`LICENSE`](LICENSE)。
+版权归 Clash Halo contributors（2026）。
+
+随应用分发的第三方组件保持各自许可证：`sing-box` 为 GPL-3.0-or-later，
+Flutter 为 BSD-3-Clause；侧栏猫头图案取自 `clash-verge-rev`（GPL-3.0），
+配色修改后仍按 GPL-3.0-or-later 分发。对外分发时需同时满足这些组件的许可证
+要求，包括提供对应源代码。

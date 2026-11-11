@@ -13,6 +13,9 @@ pwsh -NoProfile -File scripts/build-windows.ps1
 产物在 `build/windows-x64/`（`README.txt` 所述的目录，也是应用实际运行目录）。
 `-OutDir` 可覆盖，用于暂存发布。
 
+Android APK 用 `scripts/build-android.ps1`，产物在 `build/android-arm64/`，与
+`build/windows-x64/` 同级。
+
 ## 内核二进制
 
 `sing-box.exe`（79 MB）与 `libcronet.dll` 不入库（`.gitignore` 里的 `prototype/bin/`
@@ -286,11 +289,59 @@ find apps/flutter/lib packages -name "*.dart" -newer "D:/software/clash-halo-bui
 | `data/app.so` | **真正的 UI**，Flutter 产物 |
 | `halo-host.exe` | Go 宿主 |
 | `sing-box.exe` | 内核（服务安装时会复制到受保护目录） |
+| `flutter_windows.dll` | Flutter 引擎运行时，外壳靠它启动界面；无 CMake 路径由构建脚本从 SDK 缓存补齐 |
+| `native_assets.json` | 旧 CMake 流程的遗留空清单，不参与运行时加载，但安装包载荷要求它存在 |
 | `libcronet.dll` | Naive 支持 |
+| `LICENSE` | GPL-3.0-or-later 许可证全文，随运行目录与安装包分发 |
 | `data/icudtl.dat` | ICU 数据 |
 
 只替换 `clash-halo.exe` 看不到任何界面改动。部署后建议用
 `certutil -hashfile` 比对源与目标的 `data/app.so`，确认一致。
+
+## Android 构建与真机调试
+
+Android 产物与 Windows 同级，都由仓库根的 `build\` 收集：
+
+```powershell
+pwsh -NoProfile -File scripts/build-android.ps1
+```
+
+产物：`build\android-arm64\app-release.apk` 与 `app-release.apk.sha256`，与
+`build\windows-x64` 同级。脚本解析 `.tools` 下的 Flutter、JDK 与 Android SDK，
+执行 `flutter build apk --release --target-platform android-arm64`，再把 APK 从
+Flutter 中间目录 `apps/flutter/build/app/outputs/flutter-apk/` 复制过来；
+`-OutDir` 可改收集目录，`-BuildMode profile|debug` 可改构建类型。直接调用
+`flutter build apk` 时产物仍只留在该中间目录。
+
+`android/app/build.gradle.kts` 在打包阶段排除 `armeabi-v7a` 与 `x86_64`，
+APK 只含 `arm64-v8a`；libbox 也只构建了 arm64。在 x86_64 模拟器上运行需要
+先为对应 ABI 构建 libbox，否则启动 VPN 时 `:vpn` 进程会
+`UnsatisfiedLinkError`。
+
+安装与常用诊断：
+
+```powershell
+$adb = 'D:\projects\clash-halo\.tools\android\platform-tools\adb.exe'
+& $adb install -r build\android-arm64\app-release.apk
+& $adb logcat -s HaloVpn:* flutter:*
+& $adb shell dumpsys notification --noredact | Select-String -Pattern 'Clash Halo' -Context 0,3
+& $adb shell ip -o addr show | Select-String tun0
+```
+
+`:vpn` 的状态写在应用私有目录的 `vpn-state.json`（`state/message/pid/updatedAt`），
+UI 进程读取它并用 `ActivityManager` 判断 pid 是否存活；`/proc/<pid>` 在跨
+SELinux 域时不可靠。应用未 debuggable，不能用 `run-as` 读该文件，改用通知
+文本、`tun0` 与界面截图核对。
+
+触摸布局用显示密度切换核对：
+
+```powershell
+& $adb shell wm density 240   # 宽屏：可折叠侧栏 + 两列卡片
+& $adb shell wm density 400   # 窄屏：抽屉导航 + 两行表头
+& $adb shell wm density reset
+```
+
+
 
 ## 工具链不在 PATH
 

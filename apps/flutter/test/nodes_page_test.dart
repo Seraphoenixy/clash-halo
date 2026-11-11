@@ -663,6 +663,74 @@ void main() {
     });
   });
 
+  testWidgets('端口连通 data fits its heading and shares its right edge', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(2360, 1520);
+    tester.view.devicePixelRatio = 2.0;
+    addTearDown(tester.view.reset);
+
+    final tempDir = Directory.systemTemp.createTempSync('halo_reach_width');
+    final controller = AppController(
+      client: _SilentClient(),
+      dataDir: tempDir.path,
+    );
+    await controller.start(connectHost: false);
+    try {
+      controller.applySnapshotForTest(
+        const RuntimeSnapshot(stateVersion: 1, coreState: CoreState.stopped),
+        connected: true,
+      );
+      controller.saveImport(
+        importNodes('trojan://pw@a.example.com:443#节点甲'),
+      );
+      final id = controller.loadNodes().first.id;
+      controller.applyEventForTest(
+        const HaloEventMessage(
+          name: HaloEvent.taskStarted,
+          data: {'taskId': 'r'},
+        ),
+      );
+      controller.applyEventForTest(
+        HaloEventMessage(
+          name: HaloEvent.taskProgress,
+          data: {
+            'taskId': 'r',
+            'nodeId': id,
+            'metric': 'tcp',
+            'ok': true,
+            'latencyMs': 1251,
+          },
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildHaloTheme(Brightness.light),
+          home: Scaffold(body: NodesPage(controller: controller)),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(tester.takeException(), isNull);
+
+      final heading = tester.getRect(find.text('端口连通').first);
+      final reading = tester.getRect(find.text('TCP 通 1251ms').first);
+      // The header reserves the sort slot and a numeric cell now reserves the
+      // same slot, so both right edges describe one column edge.
+      expect(
+        (heading.right - reading.right).abs(),
+        lessThan(1.0),
+        reason: '端口连通表头与数据必须共用右边线',
+      );
+      expect(reading.width, greaterThan(60), reason: '数据不能被截断到几个像素');
+    } finally {
+      await controller.dispose();
+      try {
+        tempDir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
+
   group('NodesPage with nodes', () {
     late Directory tempDir;
     late AppController controller;
@@ -2041,6 +2109,102 @@ void main() {
       // The protocol-free defaults still answer: transport and TLS state.
       expect(inDialog(find.text('TCP')), findsOneWidget);
       expect(inDialog(find.text('无')), findsOneWidget);
+    });
+
+    testWidgets('shows the preserved importer fields and the full CA', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(2360, 1520);
+      tester.view.devicePixelRatio = 2.0;
+      addTearDown(tester.view.reset);
+      controller.applySnapshotForTest(
+        const RuntimeSnapshot(stateVersion: 1, coreState: CoreState.stopped),
+        connected: true,
+      );
+      const pem = '-----BEGIN CERTIFICATE-----\n'
+          'MIIBszCCAVmgAwIBAgIUY2xhc2gtaGFsbw==\n'
+          '-----END CERTIFICATE-----';
+      NodeRepository(controller.store).insert(
+        withIdentity(const ProxyNode(
+          id: '',
+          fingerprint: '',
+          name: '香港 Hysteria2',
+          protocol: ProxyProtocol.hysteria2,
+          server: 'hy2.example.com',
+          port: 443,
+          secrets: NodeSecrets(password: 'hy2-pass'),
+          tls: TlsConfig(
+            kind: TlsKind.tls,
+            serverName: 'hy2.example.com',
+            certificatePem: pem,
+          ),
+          // Parameters the model has no column for: the importer keeps them
+          // in extras, and obfs really does reach the generated config.
+          extras: {
+            'obfs': 'salamander',
+            'obfsPassword': 'obfs-secret',
+            'upMbps': '30',
+            'downMbps': '200',
+            'v2rayn': {'naiveQuic': true},
+          },
+        )),
+        nowMs: 1,
+      );
+      controller.notifyExternalChange();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildHaloTheme(Brightness.light),
+          home: Scaffold(body: NodesPage(controller: controller)),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 150));
+
+      await tester.tap(find.text('香港 Hysteria2').first);
+      await tester.pump(const Duration(milliseconds: 400));
+      await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
+      await tester.sendKeyEvent(LogicalKeyboardKey.keyD);
+      await tester.sendKeyUpEvent(LogicalKeyboardKey.controlLeft);
+      await tester.pumpAndSettle();
+
+      expect(inDialog(find.textContaining('额外配置')), findsOneWidget);
+      expect(
+        inDialog(find.textContaining('"obfs": "salamander"')),
+        findsOneWidget,
+        reason: 'Hysteria2 混淆是被生成器消费的配置，不是来源元数据',
+      );
+      expect(
+        inDialog(find.textContaining('"upMbps": "30"')),
+        findsOneWidget,
+      );
+      expect(
+        inDialog(find.textContaining('"naiveQuic": true')),
+        findsOneWidget,
+        reason: '嵌套的导入字段也要展开显示',
+      );
+
+      // Credentials inside extras follow the same toggle as UUID/password.
+      expect(
+        inDialog(find.textContaining('"obfsPassword": "••••••••"')),
+        findsOneWidget,
+      );
+      expect(inDialog(find.textContaining('obfs-secret')), findsNothing);
+
+      // The pinned CA used to be summarized as a character count only.
+      expect(inDialog(find.text('已内置（${pem.length} 字符）')), findsOneWidget);
+      expect(
+        inDialog(find.textContaining('MIIBszCCAVmgAwIBAgIUY2xhc2gtaGFsbw==')),
+        findsOneWidget,
+      );
+
+      await tester.ensureVisible(inDialog(find.text('显示凭据')));
+      await tester.pumpAndSettle();
+      await tester.tap(inDialog(find.text('显示凭据')));
+      await tester.pumpAndSettle();
+      expect(
+        inDialog(find.textContaining('"obfsPassword": "obfs-secret"')),
+        findsOneWidget,
+      );
     });
 
     testWidgets('the group field is the same dropdown as the rest of the app', (

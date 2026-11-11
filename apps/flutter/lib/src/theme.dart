@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 
 /// Fluent Design colour system.
@@ -180,6 +182,17 @@ class HaloPalette {
 Color haloAdapt(BuildContext context, Color color) =>
     HaloColors.adapt(color, Theme.of(context).brightness == Brightness.dark);
 
+/// Whether the current platform is driven by touch.
+///
+/// Keyboard hints, hover feedback and 32 px control heights are desktop
+/// conventions; on touch they read as noise or as targets that are too small.
+///
+/// Reads `dart:io` rather than `Theme.platform`: widget tests default to
+/// `TargetPlatform.android` even when they run on a desktop host, so the theme
+/// value would hide desktop hints from every existing widget test.
+bool haloTouchPlatform(BuildContext context) =>
+    Platform.isAndroid || Platform.isIOS || Platform.isFuchsia;
+
 /// Fluent geometry. Controls are 4px, containers 8px, and the two header bands
 /// share one height so the sidebar divider lines up with the page header.
 abstract final class HaloMetrics {
@@ -187,6 +200,9 @@ abstract final class HaloMetrics {
   static const radiusCard = 8.0;
 
   static const sidebarWidth = 200.0;
+
+  /// Width of the icon-only rail after the user collapses the sidebar.
+  static const sidebarCollapsedWidth = 56.0;
   static const logoBarHeight = 56.0;
 
   /// The header row above every page. One 32px control tall plus the
@@ -208,6 +224,10 @@ abstract final class HaloMetrics {
   /// full-width card underneath — three different answers to the same question,
   /// which is exactly what "the spacing is uneven" looks like.
   static const cardGap = 12.0;
+
+  /// Shared two-column breakpoint for the overview cards. Windows and Android
+  /// use the same value so the dashboard reflows at the same window width.
+  static const overviewTwoColumnBreakpoint = 860.0;
 
   /// The step *inside* a card, between two blocks of content (a switch row and
   /// its caption, a detail list and the buttons above it).
@@ -251,6 +271,9 @@ abstract final class HaloMetrics {
 
   /// Navigation item height; slightly taller than a control so the list breathes.
   static const navItemHeight = 34.0;
+
+  /// Touch-sized navigation row for narrow layouts and the drawer.
+  static const mobileNavItemHeight = 44.0;
 
   /// Fluent's easing pair. Hover/press feedback is short; larger transitions
   /// stay under 250ms so the UI never feels sluggish.

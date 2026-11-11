@@ -47,8 +47,10 @@ enum RouteMode {
   const RouteMode(this.wire);
   final String wire;
 
-  static RouteMode fromWire(String value) =>
-      RouteMode.values.firstWhere((m) => m.wire == value, orElse: () => RouteMode.rule);
+  static RouteMode fromWire(String value) => RouteMode.values.firstWhere(
+    (m) => m.wire == value,
+    orElse: () => RouteMode.rule,
+  );
 }
 
 class DnsSettings {
@@ -57,6 +59,7 @@ class DnsSettings {
     this.server = 'https://223.5.5.5/dns-query',
     this.directServer = '223.5.5.5',
     this.fakeAddress = false,
+    this.ipv6 = false,
   });
 
   final bool enabled;
@@ -64,19 +67,28 @@ class DnsSettings {
   final String directServer;
   final bool fakeAddress;
 
+  /// Whether applications may receive and use IPv6 addresses.
+  ///
+  /// Off is the safe default for the common IPv4-only proxy node: AAAA answers
+  /// are rejected and external IPv6 is blocked, so applications fall back to
+  /// IPv4 instead of sending IPv6 into a node that cannot reach it.
+  final bool ipv6;
+
   Map<String, Object?> toJson() => {
-        'enabled': enabled,
-        'server': server,
-        'directServer': directServer,
-        'fakeAddress': fakeAddress,
-      };
+    'enabled': enabled,
+    'server': server,
+    'directServer': directServer,
+    'fakeAddress': fakeAddress,
+    'ipv6': ipv6,
+  };
 
   factory DnsSettings.fromJson(Map<String, Object?> json) => DnsSettings(
-        enabled: json['enabled'] as bool? ?? true,
-        server: json['server'] as String? ?? 'https://223.5.5.5/dns-query',
-        directServer: json['directServer'] as String? ?? '223.5.5.5',
-        fakeAddress: json['fakeAddress'] as bool? ?? false,
-      );
+    enabled: json['enabled'] as bool? ?? true,
+    server: json['server'] as String? ?? 'https://223.5.5.5/dns-query',
+    directServer: json['directServer'] as String? ?? '223.5.5.5',
+    fakeAddress: json['fakeAddress'] as bool? ?? false,
+    ipv6: json['ipv6'] as bool? ?? false,
+  );
 }
 
 class TunSettings {
@@ -97,22 +109,22 @@ class TunSettings {
   final String interfaceName;
 
   Map<String, Object?> toJson() => {
-        'enabled': enabled,
-        'stack': stack,
-        'mtu': mtu,
-        'autoRoute': autoRoute,
-        'strictRoute': strictRoute,
-        'interfaceName': interfaceName,
-      };
+    'enabled': enabled,
+    'stack': stack,
+    'mtu': mtu,
+    'autoRoute': autoRoute,
+    'strictRoute': strictRoute,
+    'interfaceName': interfaceName,
+  };
 
   factory TunSettings.fromJson(Map<String, Object?> json) => TunSettings(
-        enabled: json['enabled'] as bool? ?? false,
-        stack: json['stack'] as String? ?? 'mixed',
-        mtu: (json['mtu'] as num?)?.toInt() ?? 9000,
-        autoRoute: json['autoRoute'] as bool? ?? true,
-        strictRoute: json['strictRoute'] as bool? ?? true,
-        interfaceName: json['interfaceName'] as String? ?? 'halo-tun',
-      );
+    enabled: json['enabled'] as bool? ?? false,
+    stack: json['stack'] as String? ?? 'mixed',
+    mtu: (json['mtu'] as num?)?.toInt() ?? 9000,
+    autoRoute: json['autoRoute'] as bool? ?? true,
+    strictRoute: json['strictRoute'] as bool? ?? true,
+    interfaceName: json['interfaceName'] as String? ?? 'halo-tun',
+  );
 }
 
 /// Everything the generator needs. The host persists this, not the UI.
@@ -245,6 +257,22 @@ ConfigBuildResult buildConfig(ConfigRequest request, CoreCapabilities caps) {
     // sing-box 1.14 removed the legacy `address` DNS server form; each server
     // must declare a `type`. A domain resolver also has to be named
     // explicitly or dialing a domain outbound fails validation.
+    final dnsRules = <Map<String, Object?>>[
+      // The proxy server's own name must never be resolved through the proxy.
+      // On Android, libbox outbounds with their own network stack (Naive) ask
+      // the system resolver for the server name; that query enters this VPN's
+      // DNS module and would be answered by `remote` — a DoH request that
+      // itself has to dial the proxy. The two wait on each other until the
+      // dial times out, so the VPN looks connected while every proxied
+      // connection fails. Pinning the server name to the direct resolver
+      // breaks the cycle.
+      if (_domainOf(request.node.server) case final server?)
+        {'domain': [server], 'server': 'local'},
+      // An empty successful response suppresses AAAA records without making
+      // system resolvers retry a refused query.
+      if (!request.dns.ipv6)
+        {'ip_version': 6, 'action': 'predefined', 'rcode': 'NOERROR'},
+    ];
     doc['dns'] = {
       'servers': [
         _dnsServer(tag: 'remote', url: request.dns.server, detour: 'proxy'),
@@ -257,6 +285,7 @@ ConfigBuildResult buildConfig(ConfigRequest request, CoreCapabilities caps) {
         _dnsServer(tag: 'local', url: request.dns.directServer),
       ],
       'final': 'remote',
+      if (dnsRules.isNotEmpty) 'rules': dnsRules,
     };
     (doc['route'] as Map)['default_domain_resolver'] = {'server': 'local'};
   }
@@ -276,7 +305,9 @@ ConfigBuildResult buildConfig(ConfigRequest request, CoreCapabilities caps) {
     config: GeneratedConfig(
       document: doc,
       mixedPort: request.ports.mixed,
-      clashApiPort: request.ports.enableClashApi ? request.ports.clashApi : null,
+      clashApiPort: request.ports.enableClashApi
+          ? request.ports.clashApi
+          : null,
       testPort: request.testPort,
       tunInbound: request.tun.enabled,
     ),
@@ -312,7 +343,17 @@ List<Map<String, Object?>> _ruleSetsFor(ConfigRequest request) {
 }
 
 List<Map<String, Object?>> _routeRules(ConfigRequest request) {
-  final rules = <Map<String, Object?>>[];
+  final rules = <Map<String, Object?>>[
+    // TUN connections arrive with only the destination IP. The host column and
+    // every domain-based rule set need the domain carried in TLS SNI, HTTP
+    // Host or QUIC SNI, so sniffing must run before all matchers. This action
+    // only records metadata; the outbound still comes from the rules below.
+    const {
+      'action': 'sniff',
+      'sniffer': ['tls', 'http', 'quic'],
+      'timeout': '300ms',
+    },
+  ];
   // The local resolver carries no detour (see buildConfig), so its own traffic
   // must be pinned to the direct outbound by destination. Routing it through
   // the proxy would make the proxy resolve its own server name.
@@ -363,6 +404,18 @@ String? _ipv4(String value) {
   return trimmed;
 }
 
+/// Returns [value] when it is a hostname usable in a DNS `domain` rule.
+///
+/// Mirrors [_ipv4]: an IP literal is not a domain. IPv6 addresses also contain
+/// `:`, and paths must never reach the rule, so both are rejected here.
+String? _domainOf(String value) {
+  final trimmed = value.trim().toLowerCase();
+  if (trimmed.isEmpty) return null;
+  if (_ipv4(trimmed) != null) return null;
+  if (trimmed.contains(':') || trimmed.contains('/')) return null;
+  return trimmed;
+}
+
 /// Builds a modern `dns.servers` entry from a URL-ish setting.
 ///
 /// [detour] is optional: only outbounds that can actually dial may be named
@@ -374,11 +427,7 @@ Map<String, Object?> _dnsServer({
 }) {
   final trimmed = url.trim();
   if (trimmed.isEmpty) {
-    return {
-      'type': 'local',
-      'tag': tag,
-      if (detour != null) 'detour': detour,
-    };
+    return {'type': 'local', 'tag': tag, if (detour != null) 'detour': detour};
   }
   final lower = trimmed.toLowerCase();
   final type = switch (lower.split(':').first) {
@@ -390,7 +439,8 @@ Map<String, Object?> _dnsServer({
     _ => 'udp',
   };
   final endpoint = type == 'https' ? Uri.tryParse(trimmed) : null;
-  final isDohUrl = endpoint != null && endpoint.hasAuthority && endpoint.host.isNotEmpty;
+  final isDohUrl =
+      endpoint != null && endpoint.hasAuthority && endpoint.host.isNotEmpty;
   return {
     'type': type,
     'tag': tag,
@@ -420,7 +470,8 @@ Map<String, Object?> _proxyOutbound(ProxyNode node) {
       }
     case ProxyProtocol.vless:
       common['uuid'] = node.secrets.uuid;
-      if ((node.secrets.flow ?? '').isNotEmpty) common['flow'] = node.secrets.flow;
+      if ((node.secrets.flow ?? '').isNotEmpty)
+        common['flow'] = node.secrets.flow;
     case ProxyProtocol.trojan:
       common['password'] = node.secrets.password;
     case ProxyProtocol.hysteria2:
@@ -457,6 +508,7 @@ Map<String, Object?> _proxyOutbound(ProxyNode node) {
         common['username'] = node.secrets.username;
       }
       common['password'] = node.secrets.password;
+      common['udp_over_tcp'] = true;
       if (node.isUdpTransport) common['quic'] = true;
   }
   final tls = _tlsBlock(node);
@@ -473,7 +525,8 @@ Map<String, Object?>? _tlsBlock(ProxyNode node) {
     case TlsKind.tls:
       final block = <String, Object?>{
         'enabled': true,
-        if ((node.tls.serverName ?? '').isNotEmpty) 'server_name': node.tls.serverName,
+        if ((node.tls.serverName ?? '').isNotEmpty)
+          'server_name': node.tls.serverName,
         if (node.tls.insecure) 'insecure': true,
         if (node.tls.alpn.isNotEmpty) 'alpn': node.tls.alpn,
       };
@@ -491,7 +544,8 @@ Map<String, Object?>? _tlsBlock(ProxyNode node) {
     case TlsKind.reality:
       return {
         'enabled': true,
-        if ((node.tls.serverName ?? '').isNotEmpty) 'server_name': node.tls.serverName,
+        if ((node.tls.serverName ?? '').isNotEmpty)
+          'server_name': node.tls.serverName,
         if (node.tls.insecure) 'insecure': true,
         if (node.tls.alpn.isNotEmpty) 'alpn': node.tls.alpn,
         if ((node.tls.fingerprint ?? '').isNotEmpty)
@@ -516,7 +570,8 @@ Map<String, Object?>? _transportBlock(ProxyNode node) {
         'type': 'ws',
         if ((t.path ?? '').isNotEmpty) 'path': t.path,
         if ((t.host ?? '').isNotEmpty) 'headers': {'Host': t.host},
-        if (t.earlyData != null && t.earlyData! > 0) 'max_early_data': t.earlyData,
+        if (t.earlyData != null && t.earlyData! > 0)
+          'max_early_data': t.earlyData,
       };
     case TransportKind.grpc:
       return {
@@ -548,14 +603,18 @@ String encodePrettyJson(Object? value, {int indent = 0}) {
   if (value is String) return _encodeString(value);
   if (value is List) {
     if (value.isEmpty) return '[]';
-    final items = value.map((e) => '$childPad${encodePrettyJson(e, indent: indent + 1)}');
+    final items = value.map(
+      (e) => '$childPad${encodePrettyJson(e, indent: indent + 1)}',
+    );
     return '[\n${items.join(',\n')}\n$pad]';
   }
   if (value is Map) {
     if (value.isEmpty) return '{}';
     final keys = value.keys.map((k) => '$k').toList()..sort();
-    final entries = keys.map((k) =>
-        '$childPad${_encodeString(k)}: ${encodePrettyJson(value[k], indent: indent + 1)}');
+    final entries = keys.map(
+      (k) =>
+          '$childPad${_encodeString(k)}: ${encodePrettyJson(value[k], indent: indent + 1)}',
+    );
     return '{\n${entries.join(',\n')}\n$pad}';
   }
   return _encodeString('$value');

@@ -224,6 +224,28 @@ func TestInjectRepairsPreviouslyGeneratedDoH(t *testing.T) {
 	}
 }
 
+func TestInjectRepairsPreviouslyGeneratedIPv6DNSRule(t *testing.T) {
+	const base = `{"dns":{"rules":[
+		{"domain":["proxy.example"],"server":"local"},
+		{"ip_version":6,"action":"reject"},
+		{"ip_version":6,"action":"reject","domain":["blocked.example"]},
+		{"ip_version":6,"action":"reject","method":"drop"}
+	]}}`
+	out := mustInject(t, base, DefaultOptions())
+	want := docOf(t, []byte(`{"rules":[
+		{"domain":["proxy.example"],"server":"local"},
+		{"ip_version":6,"action":"predefined","rcode":"NOERROR"},
+		{"ip_version":6,"action":"reject","domain":["blocked.example"]},
+		{"ip_version":6,"action":"reject","method":"drop"}
+	]}`))
+	if dns := docOf(t, out)["dns"]; !reflect.DeepEqual(dns, want) {
+		t.Fatalf("dns = %#v, want %#v", dns, want)
+	}
+	if again := mustInject(t, string(out), DefaultOptions()); string(again) != string(out) {
+		t.Fatal("rebuilding the TUN config changed the repaired rules")
+	}
+}
+
 func TestInjectPreservesEverythingElse(t *testing.T) {
 	before := docOf(t, []byte(richConfig))
 	out := mustInject(t, richConfig, DefaultOptions())
@@ -591,12 +613,14 @@ func TestInjectAcceptsBoundaryOptions(t *testing.T) {
 			t.Errorf("stack = %v, want %s", tun["stack"], stack)
 		}
 	}
-	// An IPv6 prefix is a valid CIDR and must round-trip unchanged.
+	// The IPv6 prefix is a valid CIDR and must round-trip unchanged next to
+	// the IPv4 one. Keeping both is what keeps ::1 reachable under
+	// strict_route.
 	opts := DefaultOptions()
-	opts.Address = "fdfe:dcba:9876::1/126"
+	opts.Address6 = "  fd00::1/126  "
 	out := mustInject(t, minimalBaseConfig, opts)
 	tun := inboundsOf(t, docOf(t, out))[1].(map[string]any)
-	if !reflect.DeepEqual(tun["address"], []any{"fdfe:dcba:9876::1/126"}) {
+	if !reflect.DeepEqual(tun["address"], []any{"172.19.0.1/30", "fd00::1/126"}) {
 		t.Errorf("address = %#v", tun["address"])
 	}
 	// Exactly the byte limit, and spaces inside the name, are both allowed.
@@ -608,12 +632,13 @@ func TestInjectAcceptsBoundaryOptions(t *testing.T) {
 	// Surrounding whitespace is trimmed rather than rejected.
 	opts.AdapterName = "  clash-halo  "
 	opts.Address = "  172.19.0.1/30  "
+	opts.Address6 = "  fdfe:dcba:9876::1/126  "
 	out = mustInject(t, minimalBaseConfig, opts)
 	tun = inboundsOf(t, docOf(t, out))[1].(map[string]any)
 	if tun["interface_name"] != "clash-halo" {
 		t.Errorf("interface_name = %v, want clash-halo", tun["interface_name"])
 	}
-	if !reflect.DeepEqual(tun["address"], []any{"172.19.0.1/30"}) {
+	if !reflect.DeepEqual(tun["address"], []any{"172.19.0.1/30", "fdfe:dcba:9876::1/126"}) {
 		t.Errorf("address = %#v", tun["address"])
 	}
 }

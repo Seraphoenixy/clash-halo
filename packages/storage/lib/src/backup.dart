@@ -422,8 +422,11 @@ abstract final class Backup {
         // One batched write: per-node insert used to mean one SELECT plus one
         // implicit commit per row, and a restore of a large backup ran on the
         // UI isolate.
-        nodes.insertAll(preview.payload.nodes, nowMs: nowMs);
-        nodesImported += preview.payload.nodes.length;
+        final written = nodes.insertAll(preview.payload.nodes, nowMs: nowMs);
+        // Count what the restore actually stored: identity is global, so a
+        // backup that carried the same connection under two profiles now
+        // restores it once and the second copy is reported as a skip.
+        nodesImported += written.stored.length;
         for (final e in preview.payload.settings.entries) {
           if (_isDeviceSpecific(e.key)) continue;
           settings.setRaw(e.key, e.value);

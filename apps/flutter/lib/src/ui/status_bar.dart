@@ -24,6 +24,11 @@ class HaloStatusBar extends StatelessWidget {
     required this.connected,
     required this.nextStep,
     required this.activeNodeName,
+    this.isAndroid = false,
+    this.androidCoreState,
+    this.androidVpnLabel,
+    this.mode,
+    this.intercepted,
     this.onOpenStep,
     this.onRetryConnect,
   });
@@ -32,6 +37,17 @@ class HaloStatusBar extends StatelessWidget {
   final bool connected;
   final NextStep? nextStep;
   final String? activeNodeName;
+
+  /// Android 上状态来自 `:vpn` 进程，不来自宿主快照。
+  final bool isAndroid;
+  final CoreState? androidCoreState;
+  final String? androidVpnLabel;
+
+  /// Android 的分流模式保存在本地设置里，快照为空。
+  final ProxyMode? mode;
+
+  /// Android 上 VPN 已连接时覆盖「是否已接管流量」的判断。
+  final bool? intercepted;
   final VoidCallback? onOpenStep;
   final VoidCallback? onRetryConnect;
 
@@ -39,9 +55,10 @@ class HaloStatusBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final p = HaloPalette.of(context);
     final snap = snapshot;
-    final core = snap?.coreState ?? CoreState.stopped;
-    final proxyOn = snap?.systemProxy.enabled ?? false;
-    final tunOn = snap?.tunState == TunState.enabled;
+    final core = androidCoreState ?? snap?.coreState ?? CoreState.stopped;
+    final proxyOn = !isAndroid && (snap?.systemProxy.enabled ?? false);
+    final tunOn = !isAndroid && snap?.tunState == TunState.enabled;
+    final currentMode = mode ?? snap?.mode ?? ProxyMode.rule;
     return Container(
       height: HaloMetrics.statusBarHeight,
       decoration: BoxDecoration(
@@ -61,6 +78,82 @@ class HaloStatusBar extends StatelessWidget {
           final wide = constraints.maxWidth >= 900;
           final medium = constraints.maxWidth >= 700;
           final narrow = constraints.maxWidth >= 560;
+          final compact = constraints.maxWidth < 640;
+          if (compact) {
+            final step = nextStep;
+            return Row(
+              children: [
+                _Item(
+                  icon: Icons.memory,
+                  label: '内核',
+                  value: coreStateLabel(core),
+                  color: coreStateColor(core),
+                ),
+                const SizedBox(width: 12),
+                Flexible(
+                  child: _Item(
+                    icon: isAndroid
+                        ? Icons.vpn_lock_outlined
+                        : Icons.dns_outlined,
+                    label: isAndroid ? 'VPN' : '节点',
+                    value: isAndroid
+                        ? (androidVpnLabel ?? '未连接')
+                        : (activeNodeName ?? '未选择'),
+                    color: isAndroid
+                        ? (core == CoreState.running
+                              ? HaloColors.success
+                              : (core == CoreState.failed
+                                    ? HaloColors.danger
+                                    : null))
+                        : (activeNodeName == null
+                              ? HaloColors.warning
+                              : p.textPrimary),
+                    muted: isAndroid
+                        ? core == CoreState.stopped
+                        : activeNodeName == null,
+                  ),
+                ),
+                const Spacer(),
+                if (step != null)
+                  Tooltip(
+                    message: step.detail,
+                    child: IconButton(
+                      onPressed: step.kind == NextStepKind.waiting
+                          ? onRetryConnect
+                          : onOpenStep,
+                      iconSize: 16,
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints.tightFor(
+                        width: 32,
+                        height: 32,
+                      ),
+                      icon: Icon(
+                        step.kind == NextStepKind.waiting
+                            ? Icons.sync
+                            : step.kind == NextStepKind.stopped
+                            ? Icons.power_settings_new
+                            : Icons.arrow_circle_right_outlined,
+                        color: HaloColors.adapt(
+                          step.kind == NextStepKind.stopped
+                              ? HaloColors.danger
+                              : HaloColors.info,
+                          p.isDark,
+                        ),
+                      ),
+                    ),
+                  )
+                else if (intercepted ?? false)
+                  Tooltip(
+                    message: '已就绪',
+                    child: Icon(
+                      Icons.check_circle_outline,
+                      size: 16,
+                      color: HaloColors.adapt(HaloColors.success, p.isDark),
+                    ),
+                  ),
+              ],
+            );
+          }
           return Row(
             children: [
               _Item(
@@ -79,7 +172,19 @@ class HaloStatusBar extends StatelessWidget {
                     : p.textPrimary,
                 muted: activeNodeName == null,
               ),
-              if (narrow) ...[
+              if (isAndroid) ...[
+                _Divider(color: p.border),
+                _Item(
+                  icon: Icons.vpn_lock_outlined,
+                  label: 'VPN',
+                  value: androidVpnLabel ?? '未连接',
+                  color: core == CoreState.running
+                      ? HaloColors.success
+                      : (core == CoreState.failed ? HaloColors.danger : null),
+                  muted: core == CoreState.stopped,
+                ),
+              ],
+              if (!isAndroid && narrow) ...[
                 _Divider(color: p.border),
                 _Item(
                   icon: Icons.lan_outlined,
@@ -91,7 +196,7 @@ class HaloStatusBar extends StatelessWidget {
                   muted: !proxyOn,
                 ),
               ],
-              if (medium) ...[
+              if (!isAndroid && medium) ...[
                 const SizedBox(width: 14),
                 _Item(
                   icon: Icons.shield_outlined,
@@ -110,7 +215,7 @@ class HaloStatusBar extends StatelessWidget {
                 _Item(
                   icon: Icons.alt_route,
                   label: '模式',
-                  value: modeLabel(snap?.mode ?? ProxyMode.rule),
+                  value: modeLabel(currentMode),
                 ),
               ],
               const Spacer(),
@@ -119,6 +224,7 @@ class HaloStatusBar extends StatelessWidget {
                   nextStep: nextStep,
                   connected: connected,
                   snapshot: snap,
+                  intercepted: intercepted,
                   onOpenStep: onOpenStep,
                   onRetryConnect: onRetryConnect,
                 ),
@@ -203,6 +309,7 @@ class _Hint extends StatelessWidget {
     required this.nextStep,
     required this.connected,
     required this.snapshot,
+    this.intercepted,
     this.onOpenStep,
     this.onRetryConnect,
   });
@@ -213,6 +320,9 @@ class _Hint extends StatelessWidget {
   /// The runtime snapshot, read only to decide whether traffic is actually
   /// intercepted before claiming 已就绪.
   final RuntimeSnapshot? snapshot;
+
+  /// Android 上 VPN 已连接即表示流量已接管；Windows 从快照推导。
+  final bool? intercepted;
   final VoidCallback? onOpenStep;
   final VoidCallback? onRetryConnect;
 
@@ -230,10 +340,11 @@ class _Hint extends StatelessWidget {
       // bar stays quiet: 系统代理 and TUN already sit a few pixels to the left
       // saying 已关闭, which is the fact, stated once.
       final snap = snapshot;
-      final intercepted =
-          (snap?.systemProxy.enabled ?? false) ||
-          ((snap?.tunState ?? TunState.disabled) == TunState.enabled);
-      if (!intercepted) return const SizedBox.shrink();
+      final interceptedNow =
+          intercepted ??
+          ((snap?.systemProxy.enabled ?? false) ||
+              ((snap?.tunState ?? TunState.disabled) == TunState.enabled));
+      if (!interceptedNow) return const SizedBox.shrink();
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [

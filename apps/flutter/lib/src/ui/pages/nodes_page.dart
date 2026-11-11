@@ -1,6 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
 
-import 'package:flutter/gestures.dart' show kPrimaryButton;
+import 'package:flutter/gestures.dart' show PointerDeviceKind, kPrimaryButton;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:halo_contracts/halo_contracts.dart';
@@ -73,6 +74,13 @@ const String _kLocalGroup = '__local__';
 const String _kGroupPrefix = 'grp:';
 
 class _NodesPageState extends State<NodesPage> {
+  /// Touch needs to drag the table horizontally to reach the right-hand
+  /// columns. On desktop the drag is left to the header's resize handles.
+  Set<PointerDeviceKind> _tableDragDevices(BuildContext context) =>
+      haloTouchPlatform(context)
+      ? const {PointerDeviceKind.touch, PointerDeviceKind.stylus}
+      : const {};
+
   final Set<String> _selected = <String>{};
 
   /// Anchor for Shift+click range selection, in the current visible order.
@@ -177,16 +185,15 @@ class _NodesPageState extends State<NodesPage> {
   @override
   void initState() {
     super.initState();
-    _results.addAll(c.speedResults);
-    _speedResults.addAll(c.downloadResults);
-    for (final entry in c.reachability.entries) {
-      _reachability[entry.key] = Map<SpeedMetric, SpeedResult>.of(entry.value);
-    }
+    _adoptSessionResults();
     // A batch started before this page was opened is still running in the
     // controller. Seed the progress from it instead of showing an idle table:
     // switching pages used to lose the strip and the per-row "测试中" markers
     // while the host kept probing.
-    final batchRunning = c.snapshot?.speedTestRunning ?? false;
+    final batchRunning =
+        c.androidSpeedTestRunning ||
+        c.speedBatchRunning ||
+        (c.snapshot?.speedTestRunning ?? false);
     if (batchRunning) {
       _testing = true;
       _taskId = c.speedTaskId;
@@ -218,8 +225,53 @@ class _NodesPageState extends State<NodesPage> {
     // A batch ends on the host, not on the last result: the host also reports
     // cancelled batches, which produce no final result at all.
     c.runtimeRevision.addListener(_onRuntime);
+    c.sessionRevision.addListener(_onSession);
     c.catalogRevision.addListener(_onCatalog);
     _announceRepairedNodes();
+  }
+
+  /// Replaces the page's local copies after the host session is re-read.
+  ///
+  /// Results outlive the window, so a window that reconnects must not keep the
+  /// maps it built before the pipe dropped: the host may be the same process
+  /// with new readings, or a new process whose session is empty.
+  void _onSession() {
+    if (!mounted) return;
+    setState(() {
+      _adoptSessionResults();
+      _taskId = c.speedTaskId;
+      _testingIds
+        ..clear()
+        ..addAll(c.speedPending);
+      _batchTotal = c.speedBatchTotal > 0
+          ? c.speedBatchTotal
+          : c.speedPending.length;
+      _testing =
+          c.androidSpeedTestRunning ||
+          c.speedBatchRunning ||
+          (c.snapshot?.speedTestRunning ?? false);
+      if (!_testing) _batchTotal = 0;
+    });
+    if (_testing) {
+      _ensureWatchdog();
+    } else {
+      _watchdog?.cancel();
+      _watchdog = null;
+      _finishReachabilityWait(c.canOperate);
+    }
+  }
+
+  void _adoptSessionResults() {
+    _results
+      ..clear()
+      ..addAll(c.speedResults);
+    _speedResults
+      ..clear()
+      ..addAll(c.downloadResults);
+    _reachability.clear();
+    for (final entry in c.reachability.entries) {
+      _reachability[entry.key] = Map<SpeedMetric, SpeedResult>.of(entry.value);
+    }
   }
 
   /// Explains a one-off upgrade repair: rows written by the old v2rayN importer
@@ -243,6 +295,7 @@ class _NodesPageState extends State<NodesPage> {
     _finishReachabilityWait(false);
     _watchdog?.cancel();
     c.runtimeRevision.removeListener(_onRuntime);
+    c.sessionRevision.removeListener(_onSession);
     c.catalogRevision.removeListener(_onCatalog);
     _speedSub?.cancel();
     _search.dispose();
@@ -270,7 +323,14 @@ class _NodesPageState extends State<NodesPage> {
     // changed `activeNodeId` on the host, the revision fired, and the page
     // ignored it. The 使用中 marker and the row highlight then described
     // whatever was active when the page was first built.
-    if (_testing && !(c.snapshot?.speedTestRunning ?? false)) {
+    // Windows trusts the host's snapshot: it is the authority even when the
+    // event stream stalled and the tracker's pending set did not clear. Android
+    // has no snapshot, so its local runner is the only source.
+    final hostRunning = c.snapshot?.speedTestRunning;
+    final batchRunning = c.isAndroid
+        ? c.androidSpeedTestRunning
+        : (hostRunning ?? c.speedBatchRunning);
+    if (_testing && !batchRunning) {
       setState(() {
         _testing = false;
         _testingIds.clear();
@@ -278,7 +338,7 @@ class _NodesPageState extends State<NodesPage> {
       });
       _watchdog?.cancel();
       _watchdog = null;
-      _finishReachabilityWait(c.connected);
+      _finishReachabilityWait(c.canOperate);
       return;
     }
     if (_testing) return;
@@ -300,7 +360,11 @@ class _NodesPageState extends State<NodesPage> {
         _watchdog = null;
         return;
       }
-      await c.refreshSnapshot();
+      if (c.isAndroid) {
+        await c.refreshAndroidVpnStatus();
+      } else {
+        await c.refreshSnapshot();
+      }
     });
   }
 
@@ -728,13 +792,22 @@ class _NodesPageState extends State<NodesPage> {
       if (_visibleDependsOnMeasurements) _visibleDirty = true;
     });
     try {
+      if (c.isAndroid) {
+        _snack('Android 测速期间会暂时断开或切换 VPN，完成后恢复原节点');
+      }
       final taskId = await c.startSpeedTest(nodeIds: ids, metric: metric);
       if (!mounted) return;
       setState(() {
         _taskId = taskId;
-        _testing = true;
+        _testing = c.isAndroid
+            ? c.androidSpeedTestRunning
+            : c.speedBatchRunning;
+        if (!_testing) {
+          _testingIds.clear();
+          _batchTotal = 0;
+        }
       });
-      _ensureWatchdog();
+      if (_testing) _ensureWatchdog();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -1206,7 +1279,7 @@ class _NodesPageState extends State<NodesPage> {
   /// Right-click menu, mirroring the reference client's row menu but grouped so
   /// that "switch", "measure", "edit" and "destroy" never sit next to each other.
   Future<void> _showRowMenu(ProxyNode node, Offset globalPosition) async {
-    final active = node.id == c.snapshot?.activeNodeId;
+    final active = node.id == c.activeNodeId;
     // Right-clicking outside the current selection retargets the menu at the
     // row under the cursor, the way Explorer does; right-clicking inside it
     // keeps the whole selection so a batch delete still works.
@@ -1358,7 +1431,7 @@ class _NodesPageState extends State<NodesPage> {
     final all = _nodes;
     final visible = visibleNodes;
     final names = _profileNames();
-    final activeId = c.snapshot?.activeNodeId;
+    final activeId = c.activeNodeId;
     final activeNode = activeId == null
         ? null
         : all.where((n) => n.id == activeId).firstOrNull;
@@ -1406,7 +1479,7 @@ class _NodesPageState extends State<NodesPage> {
           // without starting a core, so it is the right first click before a
           // latency run that costs seconds per node.
           OutlinedButton.icon(
-            onPressed: c.connected && all.isNotEmpty && !_busy
+            onPressed: c.canOperate && all.isNotEmpty && !_busy
                 ? () => _testReachability(all: true)
                 : null,
             icon: const Icon(Icons.wifi_tethering, size: 15),
@@ -1414,7 +1487,7 @@ class _NodesPageState extends State<NodesPage> {
           ),
           const SizedBox(width: 8),
           FilledButton.icon(
-            onPressed: c.connected && all.isNotEmpty && !_busy
+            onPressed: c.canOperate && all.isNotEmpty && !_busy
                 ? _testAll
                 : null,
             icon: const Icon(Icons.bolt, size: 15),
@@ -1423,7 +1496,8 @@ class _NodesPageState extends State<NodesPage> {
         ],
         const SizedBox(width: 8),
         FilledButton.icon(
-          onPressed: c.connected && _selected.length == 1 && !_busy
+          // Android 没有宿主管道：以数据库可用为门槛（见 canOperate）。
+          onPressed: c.canOperate && _selected.length == 1 && !_busy
               ? _enableSelected
               : null,
           icon: const Icon(Icons.play_arrow, size: 15),
@@ -1472,7 +1546,9 @@ class _NodesPageState extends State<NodesPage> {
                     invalidCount: visible
                         .where((node) => _isInvalidNode(node.id))
                         .length,
-                    onRemoveInvalid: (_busy || _testing) ? null : _confirmRemoveInvalid,
+                    onRemoveInvalid: (_busy || _testing)
+                        ? null
+                        : _confirmRemoveInvalid,
                     search: _search,
                     searchFocus: _searchFocus,
                     onQuery: (v) => setState(() {
@@ -1494,7 +1570,7 @@ class _NodesPageState extends State<NodesPage> {
                       _selected.removeWhere((id) => !next.contains(id));
                     }),
                     onSelectAll: () => _toggleAll(visible),
-                    onTestSelected: _selected.isEmpty || !c.connected || _busy
+                    onTestSelected: _selected.isEmpty || !c.canOperate || _busy
                         ? null
                         : _testSelected,
                     onRenameSelected: _selected.isEmpty || _busy
@@ -1543,7 +1619,7 @@ class _NodesPageState extends State<NodesPage> {
                             // scrolled the table instead of resizing a column.
                             behavior: ScrollConfiguration.of(
                               context,
-                            ).copyWith(dragDevices: const {}),
+                            ).copyWith(dragDevices: _tableDragDevices(context)),
                             child: SingleChildScrollView(
                               scrollDirection: Axis.horizontal,
                               child: SizedBox(
@@ -1683,9 +1759,10 @@ enum _SortColumn {
 /// latency to show; putting them the other way round invited reading a blank
 /// delay as a fault.
 enum _Col {
-  // Defaults fill a 1180-logical-px window at 100% with every column visible.
-  // An earlier set totalled 1126 px in a ~780 px viewport, which pushed
-  // 端口连通 / 延迟 / 速度 off screen entirely.
+  // Defaults are the widths measured from the 1600-px screenshot: all ten
+  // columns fit there, and a narrower window scrolls horizontally instead of
+  // clipping a value. An earlier set totalled 1126 px in a ~780 px viewport,
+  // which pushed 端口连通 / 延迟 / 速度 off screen entirely.
   //
   // The set below trades space from the short technical columns to the ones
   // that identify a node. 名称 and 地址 were both clipped (「AnyT…」, 「api1…」)
@@ -1696,27 +1773,31 @@ enum _Col {
   name('名称', 148, 96, numeric: false),
   protocol('类型', 62, 48, numeric: false),
   server('地址', 132, 80, numeric: false),
-  // 52 px, not 36: a port is up to five digits ("10443") plus 16 px of cell
-  // padding, and at 36 it rendered as "4..." — a port that silently loses
-  // digits is worse than one that ellipsises, because it looks like a port.
-  port('端口', 52, 46, numeric: true),
+  // 62, not 36: a port is up to five digits ("10443") plus 16 px of cell
+  // padding and the 9 px sort slot shared with the header. At 36 it rendered
+  // as "4..." — a port that silently loses digits is worse than one that
+  // ellipsises, because it looks like a port.
+  port('端口', 62, 52, numeric: true),
   transport('传输', 50, 46, numeric: false, optional: true),
   // TLS needs room for its three characters plus the reserved sort slot,
   // which is taken from every column whether or not it is the active sort.
   // Measured: 34.5 px of glyphs, so 54 clipped it to 29 and rendered "TL…".
   tls('TLS', 62, 54, numeric: false, optional: true),
   // 120, not 84: the column holds the subscription (source) name, and at 84
-  // every host-shaped name rendered as "chengaop…". The ten columns still fit
-  // a 1180px window (total 940 against 948 of content width), and the cell
-  // keeps a tooltip for the names that are longer still.
+  // every host-shaped name rendered as "chengaop…". The whole row needs
+  // 1006 px including the resizers; wider windows show it whole, narrower ones
+  // scroll, and the cell keeps a tooltip for names that are longer still.
   group('分组', 120, 46, numeric: false),
-  reachability('端口连通', 84, 76, numeric: true),
-  latency('延迟', 70, 56, numeric: true),
-  // 速度 is 76, not 58: a KB/s reading is "1023 KB/s" (9 monospace chars ≈
-  // 57 px of glyphs) and an MB/s one carries a decimal ("118.0 MB/s"), so at
-  // 58 px the cell clipped mid-number — exactly the digit a user compares
-  // rows by.
-  throughput('速度', 76, 52, numeric: true);
+  // 112, not 84: the widest common reading is "TCP 通 1251ms" (measured at
+  // ~84 px of glyphs) and the cell also reserves the header's sort slot. At 84
+  // the text ran left out of its column and collided with 分组.
+  reachability('端口连通', 112, 96, numeric: true),
+  latency('延迟', 76, 60, numeric: true),
+  // 98, not 58: a KB/s reading is "1023 KB/s" (9 monospace chars ≈ 57 px of
+  // glyphs) and an MB/s one carries a decimal ("118.0 MB/s"), so at 58 px the
+  // cell clipped mid-number — exactly the digit a user compares rows by. The
+  // extra 9 px is the reserved sort slot shared with the header.
+  throughput('速度', 98, 64, numeric: true);
 
   const _Col(
     this.label,
@@ -1897,9 +1978,7 @@ class _HeaderRow extends StatelessWidget {
                   column.label,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  textAlign: column.numeric
-                      ? TextAlign.right
-                      : TextAlign.left,
+                  textAlign: column.numeric ? TextAlign.right : TextAlign.left,
                   style: TextStyle(
                     fontSize: 11.5,
                     fontWeight: FontWeight.w600,
@@ -2091,9 +2170,11 @@ class _Toolbar extends StatelessWidget {
         controller: search,
         focusNode: searchFocus,
         onChanged: onQuery,
-        decoration: const InputDecoration(
-          hintText: '搜索名称、地址、协议（Ctrl+F）',
-          prefixIcon: Icon(Icons.search, size: 16),
+        decoration: InputDecoration(
+          hintText: haloTouchPlatform(context)
+              ? '搜索名称、地址、协议'
+              : '搜索名称、地址、协议（Ctrl+F）',
+          prefixIcon: const Icon(Icons.search, size: 16),
         ),
       ),
     );
@@ -2378,9 +2459,7 @@ class _MoreMenu extends StatelessWidget {
     // would drift between clicks.
     final box = context.findRenderObject() as RenderBox?;
     if (box == null) return;
-    final position = box.localToGlobal(
-      Offset(0, box.size.height),
-    );
+    final position = box.localToGlobal(Offset(0, box.size.height));
     final chosen = await showHaloMenu<String>(
       context: context,
       position: position,
@@ -2718,6 +2797,9 @@ class _NodeRowState extends State<_NodeRow> {
         child: GestureDetector(
           onDoubleTap: widget.onDetails,
           onSecondaryTapUp: (details) => widget.onMenu(details.globalPosition),
+          // Touch has no secondary button; long-press opens the same menu at
+          // the pressed row. Desktop keeps the right-click path.
+          onLongPressStart: (details) => widget.onMenu(details.globalPosition),
           child: Container(
             height: _kRowHeight,
             color: background,
@@ -2738,6 +2820,7 @@ class _NodeRowState extends State<_NodeRow> {
                       for (final col in widget.widths.visible) ...[
                         CellBox(
                           width: widget.widths[col],
+                          reserveSortSlot: col.numeric,
                           child: _cellContent(col),
                         ),
                         const SizedBox(width: _kResizerWidth),
@@ -2751,7 +2834,6 @@ class _NodeRowState extends State<_NodeRow> {
         ),
       ),
     );
-
   }
 }
 
@@ -2934,7 +3016,17 @@ class _ReachabilityCell extends StatelessWidget {
         // Deliberately not red: red already means "slow" in the latency column.
         _ => ('$name 不通', p.textSecondary),
       };
-      parts.add(Text(text, maxLines: 1, style: base.copyWith(color: color)));
+      parts.add(
+        Flexible(
+          child: Text(
+            text,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            softWrap: false,
+            style: base.copyWith(color: color),
+          ),
+        ),
+      );
     }
     if (parts.isEmpty) {
       return Text('—', style: base.copyWith(color: p.textTertiary));
@@ -3008,7 +3100,9 @@ class _StatusStrip extends StatelessWidget {
                   const SizedBox(width: 6),
                   Flexible(
                     child: Text(
-                      '正在测速 · $tested/$batchTotal · Esc 停止',
+                      haloTouchPlatform(context)
+                          ? '正在测速 · $tested/$batchTotal'
+                          : '正在测速 · $tested/$batchTotal · Esc 停止',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: style,
@@ -3022,7 +3116,10 @@ class _StatusStrip extends StatelessWidget {
               child: Text(
                 // Short enough to survive a 1180px window: the longer list used
                 // to ellipsise at "Ctrl+…", which told the user nothing.
-                'Enter 启用 · Delete 删除 · Ctrl+A 全选',
+                // Touch has no keyboard: point at the gesture that does exist.
+                haloTouchPlatform(context)
+                    ? '长按节点打开菜单 · 点按选择'
+                    : 'Enter 启用 · Delete 删除 · Ctrl+A 全选',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 textAlign: TextAlign.right,
@@ -3073,7 +3170,156 @@ enum LatencyFilter {
 
 /// Whether the node carries a credential the details dialog masks by default.
 bool _hasMaskableSecrets(ProxyNode node) =>
-    node.secrets.uuid != null || node.secrets.password != null;
+    node.secrets.uuid != null ||
+    node.secrets.password != null ||
+    _extrasHaveSecrets(node.extras);
+
+/// Key names whose values are credentials, not configuration.
+bool _isSecretExtraKey(String key) {
+  final k = key.toLowerCase();
+  return k.contains('password') ||
+      k.contains('passwd') ||
+      k.contains('secret') ||
+      k.contains('token') ||
+      k.contains('credential') ||
+      k == 'pwd' ||
+      k == 'pass' ||
+      k == 'auth' ||
+      k == 'authorization' ||
+      k.contains('apikey') ||
+      k.contains('api_key') ||
+      k.contains('api-key') ||
+      k.contains('privatekey') ||
+      k.contains('private_key') ||
+      k.contains('private-key') ||
+      k.contains('accesskey') ||
+      k.contains('access-key');
+}
+
+/// Credentials embedded in an otherwise harmless option string, such as an
+/// SS plugin's `password=` parameter. Masking the whole string would hide the
+/// plugin type and host too.
+final _inlineSecretPattern = RegExp(
+  r'\b(password|passwd|pwd|token|secret)=([^;&\s]+)',
+  caseSensitive: false,
+);
+
+bool _extrasHaveSecrets(Object? value, [String key = '']) {
+  if (value is Map) {
+    for (final entry in value.entries) {
+      if (_extrasHaveSecrets(entry.value, '${entry.key}')) return true;
+    }
+    return false;
+  }
+  if (value is List) {
+    return value.any((item) => _extrasHaveSecrets(item, key));
+  }
+  if (value == null || '$value'.isEmpty) return false;
+  return _isSecretExtraKey(key) ||
+      (value is String && _inlineSecretPattern.hasMatch(value));
+}
+
+/// Copies [value] with credentials replaced, leaving the rest of the
+/// configuration visible. `reveal` is the dialog's one toggle.
+Object? _maskExtraValue(
+  Object? value, {
+  required String key,
+  required bool reveal,
+}) {
+  if (reveal) return value;
+  if (value is Map) {
+    return {
+      for (final entry in value.entries)
+        '${entry.key}': _maskExtraValue(
+          entry.value,
+          key: '${entry.key}',
+          reveal: false,
+        ),
+    };
+  }
+  if (value is List) {
+    return [
+      for (final item in value) _maskExtraValue(item, key: key, reveal: false),
+    ];
+  }
+  if (value == null) return null;
+  if (_isSecretExtraKey(key)) return '••••••••';
+  if (value is String) {
+    return value.replaceAllMapped(
+      _inlineSecretPattern,
+      (match) => '${match[1]}=••••••••',
+    );
+  }
+  return value;
+}
+
+/// The full certificate, not just its length: Naive nodes pin a private CA
+/// here and the value is the only way to tell two servers apart when every
+/// other field looks the same.
+class _CertificatePem extends StatelessWidget {
+  const _CertificatePem({required this.pem});
+
+  final String pem;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = HaloPalette.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: p.input,
+          border: Border.all(color: p.border),
+          borderRadius: BorderRadius.circular(HaloMetrics.radius),
+        ),
+        child: SelectableText(
+          pem,
+          // Full width: a PEM body line is 64 characters and wraps at 11.5
+          // when the block is indented to the value column.
+          style: const TextStyle(fontFamily: 'Consolas', fontSize: 11),
+        ),
+      ),
+    );
+  }
+}
+
+/// The importer's untouched fields, human-readable and still complete.
+class _ExtraConfigBlock extends StatelessWidget {
+  const _ExtraConfigBlock({required this.extras, required this.revealSecrets});
+
+  final Map<String, Object?> extras;
+  final bool revealSecrets;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = HaloPalette.of(context);
+    final text = Theme.of(context).textTheme;
+    final masked = _maskExtraValue(extras, key: '', reveal: revealSecrets);
+    return Padding(
+      padding: const EdgeInsets.only(top: HaloMetrics.blockGap),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text('额外配置（导入时保留，部分参与连接）', style: text.bodySmall),
+          const SizedBox(height: 4),
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: p.input,
+              border: Border.all(color: p.border),
+              borderRadius: BorderRadius.circular(HaloMetrics.radius),
+            ),
+            child: SelectableText(
+              const JsonEncoder.withIndent('  ').convert(masked),
+              style: const TextStyle(fontFamily: 'Consolas', fontSize: 11.5),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 /// Every item the node's configuration carries, protocol-aware, in display
 /// order.
@@ -3081,8 +3327,9 @@ bool _hasMaskableSecrets(ProxyNode node) =>
 /// A field the protocol does not use is never shown (the model guarantees a
 /// parser never copies a password into a field the protocol ignores); a field
 /// it does use is never omitted — completeness is the whole point of the
-/// details dialog. Importer metadata in `extras` is deliberately left out:
-/// those are provenance records, not configuration this app consumes.
+/// details dialog. Importers keep parameters the model has no dedicated field
+/// for in `extras`; they are shown too, because several of them configure the
+/// connection (Hysteria2 obfs, SS plugins, the v2rayN QUIC flag).
 List<Widget> _nodeDetailRows(ProxyNode node, bool revealSecrets) {
   final s = node.secrets;
   String masked(String value) => revealSecrets ? value : '••••••••';
@@ -3145,9 +3392,7 @@ List<Widget> _nodeDetailRows(ProxyNode node, bool revealSecrets) {
     if (node.tls.alpn.isNotEmpty) {
       rows.add(InfoRow(label: 'ALPN', value: node.tls.alpn.join(', ')));
     }
-    if (node.tls.insecure) {
-      rows.add(InfoRow(label: '跳过证书校验', value: '是'));
-    }
+    rows.add(InfoRow(label: '跳过证书校验', value: node.tls.insecure ? '是' : '否'));
     if (node.tls.fingerprint != null) {
       rows.add(InfoRow(label: 'uTLS 指纹', value: node.tls.fingerprint!));
     }
@@ -3159,18 +3404,22 @@ List<Widget> _nodeDetailRows(ProxyNode node, bool revealSecrets) {
         InfoRow(label: 'Reality ShortId', value: node.tls.realityShortId!),
       );
     }
-    if (node.tls.certificatePem != null) {
-      // The PEM itself is unreadable in a two-line row; the length is the
-      // honest summary, and the value stays selectable where it matters.
-      rows.add(
-        InfoRow(
-          label: '自定义 CA',
-          value: '已内置（${node.tls.certificatePem!.length} 字符）',
-        ),
-      );
+    final pem = node.tls.certificatePem;
+    if (pem != null) {
+      rows.add(InfoRow(label: '自定义 CA', value: '已内置（${pem.length} 字符）'));
+      // The PEM used to be reduced to its length, which hid a parameter the
+      // handshake depends on. It is public certificate material, not a
+      // credential, so it is shown in full and stays selectable.
+      rows.add(_CertificatePem(pem: pem));
     }
   } else {
     rows.add(InfoRow(label: 'TLS', value: '无'));
+  }
+
+  if (node.extras.isNotEmpty) {
+    rows.add(
+      _ExtraConfigBlock(extras: node.extras, revealSecrets: revealSecrets),
+    );
   }
 
   rows.add(

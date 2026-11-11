@@ -14,7 +14,12 @@ Flutter UI (apps/flutter)  ──命名管道 NDJSON──▶  halo-host.exe (na
 
 核心不变量：**运行状态只有 `halo-host.exe` 读写**，UI 一律通过管道请求；业务数据
 （SQLite 节点、订阅、设置）由 Dart 进程直接读写，宿主不链接 SQLite。详见
-[docs/架构.md](docs/架构.md)。UI 退出不停止代理。
+[docs/架构.md](docs/架构.md)。UI 退出不停止代理。测速结果与 Windows 流量统计也
+归宿主所有：UI 关闭不取消任务、不清空结果，宿主退出才结束会话。
+
+Android 端没有 `halo-host`：Flutter UI 经平台通道驱动独立 `:vpn` 进程里的
+libbox，状态写在应用私有目录的 `vpn-state.json`。见
+[native/android/README.md](native/android/README.md)。
 
 ## 五条硬约束
 
@@ -58,6 +63,7 @@ Flutter UI (apps/flutter)  ──命名管道 NDJSON──▶  halo-host.exe (na
 | `packages/storage` | SQLite schema 与仓储 |
 | `native/windows` | Go 宿主，模块 `clash-halo/native/windows` |
 | `native/windows/internal/contract` | 与 `packages/contracts` 一一对应 |
+| `native/android` | Android VPN 模块（`:vpn` 进程 + libbox），见其 README |
 
 **`packages/contracts` 与 `native/windows/internal/contract` 必须同步改**，
 否则 UI 连不上或读不懂。
@@ -72,4 +78,4 @@ Flutter UI (apps/flutter)  ──命名管道 NDJSON──▶  halo-host.exe (na
 
 ## 当前状态
 
-仓库零提交，所有文件已暂存未提交。
+仓库已有初始提交；后续改动已暂存，尚未提交。

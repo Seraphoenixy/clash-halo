@@ -49,7 +49,43 @@ class ThroughputMonitor {
   /// The last [historyLength] total rates, oldest first.
   final List<(double, double)> history = [];
 
+  int _activeConnections = 0;
+
   bool get hasSample => _at != null;
+
+  /// Replaces the monitor with a snapshot the host produced.
+  ///
+  /// The host samples while no window exists, so its totals and history are the
+  /// only continuous record. The UI must not difference a second time from the
+  /// current connection list: that would restart the counters at zero whenever
+  /// the window reopened.
+  void restore({
+    required int uploadTotal,
+    required int downloadTotal,
+    required double upRate,
+    required double downRate,
+    required double peakUp,
+    required double peakDown,
+    required List<(double, double)> history,
+    required int activeConnections,
+  }) {
+    _at = DateTime.now();
+    _up = uploadTotal;
+    _down = downloadTotal;
+    this.upRate = upRate;
+    this.downRate = downRate;
+    this.peakUp = peakUp;
+    this.peakDown = peakDown;
+    this.history
+      ..clear()
+      ..addAll(history);
+    while (this.history.length > historyLength) {
+      this.history.removeAt(0);
+    }
+    _activeConnections = activeConnections;
+    perConnection = {};
+    _bytes.clear();
+  }
 
   /// Whether there is a curve to draw, not merely a sample.
   ///
@@ -60,7 +96,7 @@ class ThroughputMonitor {
   bool get hasCurve => history.length >= 2;
   int get uploadTotal => _up;
   int get downloadTotal => _down;
-  int get activeConnections => _bytes.length;
+  int get activeConnections => _activeConnections;
 
   /// The interval below which a delta is too short to divide by: two polls
   /// closer together than this are either a duplicate or a clock problem.
@@ -107,7 +143,6 @@ class ThroughputMonitor {
       while (history.length > historyLength) {
         history.removeAt(0);
       }
-
     }
 
     _at = at;
@@ -120,6 +155,7 @@ class ThroughputMonitor {
       ..addEntries(
         connections.map((c) => MapEntry(c.id, (c.upload, c.download))),
       );
+    _activeConnections = _bytes.length;
   }
 
   /// Forgets everything, including the peaks. Used when the core is known to
@@ -135,6 +171,7 @@ class ThroughputMonitor {
     peakDown = 0;
     perConnection = {};
     history.clear();
+    _activeConnections = 0;
   }
 }
 
@@ -150,7 +187,9 @@ String rateLabel(double bytesPerSecond) {
   final rounded = bytesPerSecond.round();
   if (rounded <= 0) return '0 B/s';
   if (rounded < 1024) return '$rounded B/s';
-  if (rounded < 1024 * 1024) return '${(rounded / 1024).toStringAsFixed(1)} KB/s';
+  if (rounded < 1024 * 1024) {
+    return '${(rounded / 1024).toStringAsFixed(1)} KB/s';
+  }
   if (rounded < 1024 * 1024 * 1024) {
     return '${(rounded / (1024 * 1024)).toStringAsFixed(2)} MB/s';
   }

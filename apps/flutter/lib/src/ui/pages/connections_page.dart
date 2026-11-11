@@ -46,15 +46,18 @@ class ConnectionsPage extends StatefulWidget {
 enum _SortKey { host, process, rule, chain, traffic, upRate, downRate, age }
 
 const List<TableColumn> _kColumns = [
-  // Widths total 724 px at their defaults, so all eight columns fit beside the
-  // close button inside a 1180-px window.
+  // Widths total 816 px at their defaults, measured from the same 1600-px
+  // window as the node table: the whole row plus resizers needs 884 px, so all
+  // eight columns fit beside the close button there and a narrower window
+  // scrolls. 流量 and the two rate columns were the ones whose values ran past
+  // their headings at the old 84/62 px.
   TableColumn(label: '主机', defaultWidth: 138, minWidth: 96),
-  TableColumn(label: '进程', defaultWidth: 76, minWidth: 60),
+  TableColumn(label: '进程', defaultWidth: 84, minWidth: 60),
   TableColumn(label: '规则', defaultWidth: 88, minWidth: 64),
-  TableColumn(label: '代理链', defaultWidth: 96, minWidth: 70),
-  TableColumn(label: '流量', defaultWidth: 84, minWidth: 70, numeric: true),
-  TableColumn(label: '上速', defaultWidth: 62, minWidth: 54, numeric: true),
-  TableColumn(label: '下速', defaultWidth: 62, minWidth: 54, numeric: true),
+  TableColumn(label: '代理链', defaultWidth: 110, minWidth: 70),
+  TableColumn(label: '流量', defaultWidth: 160, minWidth: 100, numeric: true),
+  TableColumn(label: '上速', defaultWidth: 96, minWidth: 66, numeric: true),
+  TableColumn(label: '下速', defaultWidth: 96, minWidth: 66, numeric: true),
   TableColumn(label: '时长', defaultWidth: 56, minWidth: 46, numeric: true),
 ];
 
@@ -74,8 +77,6 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
 
   String _query = '';
   List<LiveConnection> _connections = const [];
-  int _uploadTotal = 0;
-  int _downloadTotal = 0;
   String _controllerName = '';
   DateTime? _updatedAt;
   String? _error;
@@ -101,10 +102,19 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
     super.initState();
     unawaited(_refresh());
     _timer = Timer.periodic(_pollInterval, (_) => unawaited(_refresh()));
+    // The headline figures are the host session, not this page's own poll.
+    // Listening here keeps them identical to the overview card while the page
+    // is open, and they keep their values when it is reopened.
+    c.trafficRevision.addListener(_onTraffic);
+  }
+
+  void _onTraffic() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    c.trafficRevision.removeListener(_onTraffic);
     _timer?.cancel();
     _search.dispose();
     _searchFocus.dispose();
@@ -132,8 +142,6 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
         _updatedAt = DateTime.now();
         _throughput.sample(snapshot, _updatedAt!);
         _connections = snapshot.connections;
-        _uploadTotal = snapshot.uploadTotal;
-        _downloadTotal = snapshot.downloadTotal;
         _controllerName = snapshot.controller;
         // Selection is by id, and ids disappear when a connection closes; drop
         // the stale ones so "delete selected" cannot target something gone.
@@ -479,8 +487,9 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
     final p = HaloPalette.of(context);
 
     final subtitle = _connections.isNotEmpty && _updatedAt != null
-        ? '${_connections.length} 个活动连接 · 上行 ${formatBytes(_uploadTotal)} · '
-              '下行 ${formatBytes(_downloadTotal)}'
+        ? '${_connections.length} 个活动连接 · 代理流量 '
+              '上行 ${formatBytes(c.throughput.uploadTotal)} · '
+              '下行 ${formatBytes(c.throughput.downloadTotal)}'
         : !running
         ? '代理内核未运行，启动后才能看到连接'
         : _updatedAt == null
@@ -516,10 +525,7 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
       ],
       child: Column(
         children: [
-          _SpeedStrip(
-            throughput: _throughput,
-            paused: _paused || !(_updatedAt != null),
-          ),
+          _SpeedStrip(throughput: c.throughput),
           const SizedBox(height: HaloMetrics.blockGap),
           Row(
             children: [
@@ -532,9 +538,11 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
                     _query = v.trim();
                     _visibleCache = null;
                   }),
-                  decoration: const InputDecoration(
-                    hintText: '搜索主机、进程、规则或代理链（Ctrl+F）',
-                    prefixIcon: Icon(Icons.search, size: 16),
+                  decoration: InputDecoration(
+                    hintText: haloTouchPlatform(context)
+                        ? '搜索主机、进程、规则或代理链'
+                        : '搜索主机、进程、规则或代理链（Ctrl+F）',
+                    prefixIcon: const Icon(Icons.search, size: 16),
                   ),
                 ),
               ),
@@ -693,12 +701,11 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
   }
 }
 
-/// Aggregate throughput, with a sparkline of the last minute.
+/// Aggregate proxy throughput, from the same host session as the overview.
 class _SpeedStrip extends StatelessWidget {
-  const _SpeedStrip({required this.throughput, required this.paused});
+  const _SpeedStrip({required this.throughput});
 
   final ThroughputMonitor throughput;
-  final bool paused;
 
   @override
   Widget build(BuildContext context) {
@@ -763,10 +770,8 @@ class _SpeedStrip extends StatelessWidget {
           ),
           const SizedBox(width: 12),
           Text(
-            paused
-                ? '已暂停'
-                : '峰值 ↑${rateLabel(throughput.peakUp)} '
-                      '↓${rateLabel(throughput.peakDown)}',
+            '峰值 ↑${rateLabel(throughput.peakUp)} '
+            '↓${rateLabel(throughput.peakDown)}',
             style: TextStyle(fontSize: 11, color: p.textTertiary),
           ),
         ],
@@ -915,6 +920,9 @@ class _RowState extends State<_Row> {
     return GestureDetector(
       onTap: widget.onSelect,
       onSecondaryTapUp: (d) => widget.onMenu(d.globalPosition),
+      // Touch devices have no secondary-button event; long-press is the
+      // equivalent gesture and opens the menu for the pressed row.
+      onLongPressStart: (d) => widget.onMenu(d.globalPosition),
       child: MouseRegion(
         onEnter: (_) => setState(() => _hovered = true),
         onExit: (_) => setState(() => _hovered = false),
@@ -991,6 +999,7 @@ class _RowState extends State<_Row> {
                 CellBox(
                   width: widget.widths[4],
                   alignRight: true,
+                  reserveSortSlot: true,
                   child: Text(
                     '↑${formatBytes(conn.upload)} ↓${formatBytes(conn.download)}',
                     maxLines: 1,
@@ -1003,18 +1012,21 @@ class _RowState extends State<_Row> {
                 CellBox(
                   width: widget.widths[5],
                   alignRight: true,
+                  reserveSortSlot: true,
                   child: _RateText(rate: upRate, dim: true),
                 ),
                 const SizedBox(width: kResizerWidth),
                 CellBox(
                   width: widget.widths[6],
                   alignRight: true,
+                  reserveSortSlot: true,
                   child: _RateText(rate: downRate),
                 ),
                 const SizedBox(width: kResizerWidth),
                 CellBox(
                   width: widget.widths[7],
                   alignRight: true,
+                  reserveSortSlot: true,
                   child: Text(
                     age == null ? '—' : _shortDuration(age),
                     textAlign: TextAlign.right,
@@ -1113,7 +1125,9 @@ class _StatusStrip extends StatelessWidget {
         ),
         const Spacer(),
         Text(
-          'Ctrl+A 全选 · Delete 关闭 · Ctrl+F 搜索 · F5 刷新',
+          haloTouchPlatform(context)
+              ? '长按连接打开菜单 · 点按选择'
+              : 'Ctrl+A 全选 · Delete 关闭 · Ctrl+F 搜索 · F5 刷新',
           style: TextStyle(fontSize: 11, color: p.textTertiary),
         ),
       ],

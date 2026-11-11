@@ -158,16 +158,14 @@ func (m *Manager) Ensure() (string, string) {
 	ping, reachable := d.Ping(400 * time.Millisecond)
 	if reachable {
 		coreMatches := localMatches(m.LocalCoreHash(), ping.CoreSHA256)
-		// A service from an older build has the core but not the files it loads
-		// beside it (libcronet.dll for Naive). Its core hash still matches, so
-		// refresh instead of failing later with "cronet: library not found".
+		// Service fixes and companion files can change without changing the core.
 		runtimeComplete := ping.CoreRuntime >= tunservice.CoreRuntimeVersion
 		if coreMatches && runtimeComplete {
 			return "ready", ""
 		}
 		message := "应用内核已更新，正在更新 TUN 服务（需要一次管理员授权）"
 		if coreMatches {
-			message = "TUN 服务缺少内核运行时组件，正在修复（需要一次管理员授权）"
+			message = "正在更新 TUN 服务（需要一次管理员授权）"
 		}
 		d.MarkTun(state.TunPending, message, 0, "", false)
 		d.Log.Writef("[host] TUN 服务需要更新（core=%v runtime=%d/%d）",

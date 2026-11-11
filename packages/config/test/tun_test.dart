@@ -30,19 +30,19 @@ String _prettyJson(Object? value) =>
     const JsonEncoder.withIndent('  ').convert(value);
 
 Map<String, Object?> _baseConfig() => {
-      'log': {'level': 'warn'},
-      'inbounds': [
-        {
-          'type': 'mixed',
-          'tag': 'mixed-in',
-          'listen': '127.0.0.1',
-          'listen_port': 7890,
-        },
-      ],
-      'outbounds': [
-        {'type': 'direct', 'tag': 'direct'},
-      ],
-    };
+  'log': {'level': 'warn'},
+  'inbounds': [
+    {
+      'type': 'mixed',
+      'tag': 'mixed-in',
+      'listen': '127.0.0.1',
+      'listen_port': 7890,
+    },
+  ],
+  'outbounds': [
+    {'type': 'direct', 'tag': 'direct'},
+  ],
+};
 
 void main() {
   group('tun fixture', () {
@@ -61,7 +61,7 @@ void main() {
       // later, so it is asserted right here.
       expect(tun.containsKey('inet4_address'), isFalse);
       expect(tun.containsKey('inet6_address'), isFalse);
-      expect(tun['address'], ['172.19.0.1/30']);
+      expect(tun['address'], ['172.19.0.1/30', 'fdfe:dcba:9876::1/126']);
     });
   });
 
@@ -71,7 +71,7 @@ void main() {
         'type': 'tun',
         'tag': 'tun-in',
         'interface_name': 'clash-halo',
-        'address': ['172.19.0.1/30'],
+        'address': ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
         'mtu': 9000,
         'auto_route': true,
         'strict_route': true,
@@ -83,13 +83,14 @@ void main() {
       final tun = buildTunInbound(
         adapterName: 'halo-tun',
         address: '10.7.0.1/30',
+        address6: 'fd00::1/126',
         stack: 'system',
         mtu: 1500,
         autoRoute: false,
         strictRoute: false,
       );
       expect(tun['interface_name'], 'halo-tun');
-      expect(tun['address'], ['10.7.0.1/30']);
+      expect(tun['address'], ['10.7.0.1/30', 'fd00::1/126']);
       expect(tun['stack'], 'system');
       expect(tun['mtu'], 1500);
       expect(tun['auto_route'], isFalse);
@@ -118,7 +119,8 @@ void main() {
           {'type': 'mixed', 'tag': 'mixed-in', 'listen_port': 7890},
         ],
       };
-      final inbounds = (applyTunInbound(config)['inbounds'] as List).cast<Map>();
+      final inbounds = (applyTunInbound(config)['inbounds'] as List)
+          .cast<Map>();
       expect(inbounds.length, 2);
       expect(inbounds.first, buildTunInbound());
       expect(inbounds.first['stack'], 'mixed');
@@ -133,30 +135,36 @@ void main() {
           {'type': 'tun', 'tag': 'tun-in'},
         ],
       };
-      final inbounds = (applyTunInbound(config)['inbounds'] as List).cast<Map>();
+      final inbounds = (applyTunInbound(config)['inbounds'] as List)
+          .cast<Map>();
       expect(inbounds.where((i) => i['type'] == 'tun').length, 1);
       expect(inbounds.length, 2);
       expect(inbounds.first['tag'], 'mixed-in');
       expect(inbounds.last, buildTunInbound());
     });
 
-    test('forces route.auto_detect_interface and creates route when missing', () {
-      final out = applyTunInbound(_baseConfig());
-      expect((out['route'] as Map)['auto_detect_interface'], isTrue);
+    test(
+      'forces route.auto_detect_interface and creates route when missing',
+      () {
+        final out = applyTunInbound(_baseConfig());
+        expect((out['route'] as Map)['auto_detect_interface'], isTrue);
 
-      final forced = applyTunInbound({
-        'route': {'auto_detect_interface': false, 'final': 'proxy'},
-      });
-      expect((forced['route'] as Map)['auto_detect_interface'], isTrue);
-      expect((forced['route'] as Map)['final'], 'proxy');
-    });
+        final forced = applyTunInbound({
+          'route': {'auto_detect_interface': false, 'final': 'proxy'},
+        });
+        expect((forced['route'] as Map)['auto_detect_interface'], isTrue);
+        expect((forced['route'] as Map)['final'], 'proxy');
+      },
+    );
 
     test('preserves unrelated inbounds, outbounds and route keys', () {
       final config = _baseConfig();
       (config['inbounds'] as List).add({'type': 'http', 'tag': 'test-in'});
       (config['outbounds'] as List).add({'type': 'block', 'tag': 'block'});
       config['route'] = {'final': 'proxy'};
-      config['experimental'] = {'cache_file': {'enabled': true}};
+      config['experimental'] = {
+        'cache_file': {'enabled': true},
+      };
 
       final out = applyTunInbound(config);
       final inbounds = (out['inbounds'] as List).cast<Map>();
@@ -180,8 +188,10 @@ void main() {
       // The result is a deep copy: editing it must not reach back into input.
       expect(identical(out['inbounds'], config['inbounds']), isFalse);
       expect(
-        identical((out['inbounds'] as List).first,
-            (config['inbounds'] as List).first),
+        identical(
+          (out['inbounds'] as List).first,
+          (config['inbounds'] as List).first,
+        ),
         isFalse,
       );
       expect(identical(out['route'], config['route']), isFalse);
@@ -194,7 +204,8 @@ void main() {
         {},
         {'inbounds': 'not-a-list'},
       ]) {
-        final inbounds = (applyTunInbound(config)['inbounds'] as List).cast<Map>();
+        final inbounds = (applyTunInbound(config)['inbounds'] as List)
+            .cast<Map>();
         expect(inbounds.single, buildTunInbound());
       }
     });
@@ -205,11 +216,23 @@ void main() {
       expect(hasTunInbound({}), isFalse);
       expect(hasTunInbound(_baseConfig()), isFalse);
       expect(hasTunInbound({'inbounds': 'not-a-list'}), isFalse);
-      expect(hasTunInbound({'inbounds': [{'type': 'mixed'}]}), isFalse);
+      expect(
+        hasTunInbound({
+          'inbounds': [
+            {'type': 'mixed'},
+          ],
+        }),
+        isFalse,
+      );
     });
 
     test('true when a tun inbound is present, wherever it sits', () {
-      expect(hasTunInbound({'inbounds': [buildTunInbound()]}), isTrue);
+      expect(
+        hasTunInbound({
+          'inbounds': [buildTunInbound()],
+        }),
+        isTrue,
+      );
       expect(
         hasTunInbound({
           'inbounds': [
@@ -253,7 +276,8 @@ void main() {
       addTearDown(() => dir.deleteSync(recursive: true));
       final file = File('${dir.path}/config.json');
       file.writeAsStringSync(
-          _prettyJson(applyTunInbound(_baseConfig())) + '\n');
+        _prettyJson(applyTunInbound(_baseConfig())) + '\n',
+      );
       final check = Process.runSync(_singbox.path, ['check', '-c', file.path]);
       expect(check.exitCode, 0, reason: '${check.stdout}${check.stderr}');
     });
@@ -266,12 +290,14 @@ void main() {
       final legacy = buildTunInbound()
         ..remove('address')
         ..['inet4_address'] = '172.19.0.1/30';
-      file.writeAsStringSync(_prettyJson({
-        'inbounds': [legacy],
-        'outbounds': [
-          {'type': 'direct', 'tag': 'direct'},
-        ],
-      }));
+      file.writeAsStringSync(
+        _prettyJson({
+          'inbounds': [legacy],
+          'outbounds': [
+            {'type': 'direct', 'tag': 'direct'},
+          ],
+        }),
+      );
       final check = Process.runSync(_singbox.path, ['check', '-c', file.path]);
       expect(check.exitCode, isNot(0));
       expect('${check.stdout}${check.stderr}', contains('legacy tun address'));

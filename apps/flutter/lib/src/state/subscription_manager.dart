@@ -20,6 +20,7 @@ class SubscriptionUpdate {
     this.failures = const [],
     this.skippedKinds = const {},
     this.skippedSamples = const [],
+    this.crossDuplicates = const [],
     this.viaProxy = false,
   });
 
@@ -56,8 +57,21 @@ class SubscriptionUpdate {
   /// The first few skipped entries, so 重复 can be shown rather than counted.
   final List<ImportIssue> skippedSamples;
 
+  /// Connections this refresh did not store because another profile already
+  /// owns them (or the same body listed them twice and the parser missed it).
+  ///
+  /// Separate from [skippedSamples] because the two answers read differently:
+  /// a parser skip means "this body repeated itself", a cross duplicate means
+  /// "another subscription already carries this node" — the latter is the
+  /// number a user with overlapping aggregator subscriptions needs in order
+  /// to understand why the row's node count is smaller than the source list.
+  final List<ImportIssue> crossDuplicates;
+
   /// Entries skipped because the same node appeared twice in the body.
   int get duplicateCount => skippedKinds['duplicate'] ?? 0;
+
+  /// Connections skipped because another profile already owns them.
+  int get crossDuplicateCount => crossDuplicates.length;
 
   /// Whether this download went through the local proxy.
   ///
@@ -200,8 +214,22 @@ class SubscriptionManager {
       final skippedSamples = imported.skipped
           .take(SubscriptionUpdate.sampleFailureLimit)
           .toList();
-      store().transaction((_) {
-        nodes().replaceProfileNodes(profile.id, imported.nodes, nowMs: now);
+      // Owner names for the skip reports, resolved before the transaction so
+      // the audit row and the update result carry the same wording.
+      final ownerNames = {for (final p in loadProfiles()) p.id: p.name};
+      String describeOwner(SkippedDuplicate hit) {
+        if (hit.sameBatch) return '同一份订阅里出现多次';
+        final owner = ownerNames[hit.ownerProfileId];
+        if (owner == null) return '已存在于其他订阅';
+        return '已存在于订阅「$owner」';
+      }
+
+      final (replaced, storageDuplicates) = store().transaction((_) {
+        final replaced = nodes().replaceProfileNodes(
+          profile.id,
+          imported.nodes,
+          nowMs: now,
+        );
         subscriptions().upsert(
           profile.copyWith(
             lastUpdatedAtMs: now,
@@ -213,9 +241,22 @@ class SubscriptionManager {
                 ? '当天文件尚未发布，已使用 ${download.fallbackDays} 天前的文件'
                 : null,
             clearLastError: !download.usedFallback,
-            nodeCount: imported.nodes.length,
+            // The count the row shows is what this profile owns after the
+            // replace, not what the source listed: overlapping aggregators
+            // republish each other's nodes and those are skipped below, so
+            // the source count would disagree with what the node page's
+            // filter shows for the very same row.
+            nodeCount: replaced.stored.length,
           ),
         );
+        final storageDuplicates = [
+          for (final hit in replaced.skippedDuplicates)
+            ImportIssue(
+              kind: ImportFailureKind.duplicate,
+              message: describeOwner(hit),
+              note: hit.node.name,
+            ),
+        ];
         // The audit row is written in the same transaction as the nodes it
         // describes: a refresh that stored 48 nodes and lost the record of the
         // other 1462 would leave exactly the question this log answers
@@ -236,9 +277,16 @@ class SubscriptionManager {
               for (final issue in skippedSamples) issue.toJson(),
             ],
             'skippedOmitted': imported.skippedCount - skippedSamples.length,
+            'crossDuplicates': storageDuplicates.length,
+            'crossSamples': [
+              for (final issue in storageDuplicates
+                  .take(SubscriptionUpdate.sampleFailureLimit))
+                issue.toJson(),
+            ],
             'channel': useProxy ? 'proxy' : 'direct',
           }),
         );
+        return (replaced, storageDuplicates);
       });
       return SubscriptionUpdate(
         imported: imported.nodes.length,
@@ -251,6 +299,7 @@ class SubscriptionManager {
         failures: samples,
         skippedKinds: imported.skippedKinds,
         skippedSamples: skippedSamples,
+        crossDuplicates: storageDuplicates,
         viaProxy: useProxy,
       );
     } catch (error) {

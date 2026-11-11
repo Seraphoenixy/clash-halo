@@ -13,14 +13,19 @@ workspace:
   - packages/config
   - packages/storage
 
-# The system winsqlite3.dll is present on supported Windows versions. Build
-# hooks load it instead of downloading and shipping a second SQLite. This is
-# read by hooks run from the workspace root, which is the root package for
-# `dart test` and `flutter test` in the member packages.
+# Windows loads the system winsqlite3.dll (present on supported Windows
+# versions) instead of shipping a second SQLite. Every other target — Android
+# has no app-visible system libsqlite3 since API 27 — downloads the package's
+# precompiled library. `source`/`name` accept a per-OS map (sqlite3 3.x hook
+# contract, see lib/src/hook/compile/description.dart). This is read by hooks
+# run from the workspace root, which is the root package for `dart test` and
+# `flutter test` in the member packages.
 hooks:
   user_defines:
     sqlite3:
-      source: system
+      source:
+        windows: system
+        default: sqlite3
       name:
         windows: winsqlite3
         default: sqlite3

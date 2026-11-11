@@ -128,12 +128,23 @@ class CellBox extends StatelessWidget {
     required this.width,
     required this.child,
     this.alignRight = false,
+    this.reserveSortSlot = false,
     this.onTap,
   });
 
   final double width;
   final Widget child;
   final bool alignRight;
+
+  /// Leaves the sort-indicator slot empty on the right of a data cell.
+  ///
+  /// The header always keeps [SortArrowSlot.width] for the arrow, whether that
+  /// column is sorted or not. A right-aligned data cell that used the full
+  /// content width therefore ended nine pixels to the right of its heading.
+  /// Reserving the same slot here makes the header label and the number share
+  /// one right edge; it is only needed for numeric columns, whose labels are
+  /// right-aligned too.
+  final bool reserveSortSlot;
 
   /// When set, the whole column width becomes one tap target.
   ///
@@ -149,12 +160,19 @@ class CellBox extends StatelessWidget {
         ? Align(alignment: Alignment.centerRight, child: child)
         : child;
     final padded = Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8),
+      padding: EdgeInsets.only(
+        left: 8,
+        right: 8 + (reserveSortSlot ? SortArrowSlot.width : 0),
+      ),
       child: content,
     );
+    // A Row or an unbreakable number can still measure wider than the cell.
+    // Clipping is the last line of defence: it keeps that paint out of the
+    // neighbouring column even when ellipsis could not be applied.
+    final clipped = ClipRect(child: padded);
     return SizedBox(
       width: width,
-      child: onTap == null ? padded : InkWell(onTap: onTap, child: padded),
+      child: onTap == null ? clipped : InkWell(onTap: onTap, child: clipped),
     );
   }
 }
@@ -166,11 +184,7 @@ class CellBox extends StatelessWidget {
 /// with an empty hit area, so the drag never started and the column could not be
 /// resized despite the callback being wired correctly.
 class ColumnResizer extends StatefulWidget {
-  const ColumnResizer({
-    super.key,
-    required this.onDelta,
-    this.height = 34,
-  });
+  const ColumnResizer({super.key, required this.onDelta, this.height = 34});
 
   final ValueChanged<double> onDelta;
   final double height;

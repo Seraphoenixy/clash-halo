@@ -302,6 +302,7 @@ Section "${APP_NAME}" SecMain
   File "${PAYLOAD}\flutter_windows.dll"
   File "${PAYLOAD}\libcronet.dll"
   File "${PAYLOAD}\native_assets.json"
+  File "${PAYLOAD}\LICENSE"
   ; 命令行工具是可选的：没有它图形界面照常使用。
   File /nonfatal "${PAYLOAD}\halo-cli.exe"
   File "${PAYLOAD}\halo-host.exe"
@@ -412,6 +413,7 @@ Section "Uninstall"
   Delete "$INSTDIR\flutter_windows.dll"
   Delete "$INSTDIR\libcronet.dll"
   Delete "$INSTDIR\native_assets.json"
+  Delete "$INSTDIR\LICENSE"
   ; 便携标记只出现在「直接解压运行」的目录里；装了安装包之后它不该留下。
   Delete "$INSTDIR\portable.flag"
 

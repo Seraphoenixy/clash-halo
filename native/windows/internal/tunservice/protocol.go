@@ -128,10 +128,8 @@ type PingResult struct {
 	CoreSHA256   string `json:"coreSha256"`
 	DataDir      string `json:"dataDir"`
 	ServiceState string `json:"serviceState"`
-	// CoreRuntime is the version of the companion-file set staged beside the
-	// approved core. A service installed before those files were staged reports
-	// 0, which tells the host to refresh the install rather than let the core
-	// fail at the first `sing-box check` with a missing library.
+	// CoreRuntime is the revision of the installed TUN service and core runtime.
+	// The host refreshes older revisions when TUN is enabled.
 	CoreRuntime int `json:"coreRuntime"`
 }
 

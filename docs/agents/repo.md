@@ -100,6 +100,16 @@ schema v6 起 `subscriptions` 多了 `kind`（`remote` / `local`）、`group_id`
 `NodeRepository.insertAll`）。旧的 `profile_id IS NULL` 行由 v6 迁移一次性收养，
 迁移可重复执行。
 
+schema v8 起**节点身份是全局的**：`nodes` 的唯一索引只有 `(fingerprint)`，
+一个连接全库只存一行，归属首次导入它的订阅。此前索引按
+`(fingerprint, profile_id)` 隔离，重叠的聚合订阅各存一份同名不同名的副本，
+手工删除会被下次刷新复活。订阅刷新（`replaceProfileNodes`）与导入
+（`insertAll`）遇到指纹已归属其他订阅的节点会**跳过并报告**（跨订阅重复），
+不再写第二份；订阅行的 `node_count` 是刷新后实际归属的行数，不是来源列表
+长度。v8 迁移把存量重复合并为一行（保留最早 `created_at` 的行），删除数记录
+在 meta `db.mergedDuplicateNodes`。同 server:port 但 SNI/uTLS/ws path 不同的
+节点是指纹意义上的不同连接，**不合并**。
+
 `nodes.port` 存的是**字符串**（如 `'443'`），不是整数。
 
 ## 导入失败怎么记

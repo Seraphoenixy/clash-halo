@@ -243,12 +243,12 @@ void main() {
       final first = repo.replaceProfileNodes(
           'p1', [_node('x'), _node('y')],
           nowMs: 10, keepNames: true);
-      repo.renameNodes({first.first.id: '我的节点'}, nowMs: 11);
+      repo.renameNodes({first.stored.first.id: '我的节点'}, nowMs: 11);
       final second = repo.replaceProfileNodes(
           'p1', [_node('x'), _node('z')],
           nowMs: 20, keepNames: true);
       expect(repo.nodesForProfile('p1').length, 2);
-      expect(second.first.name, '我的节点');
+      expect(second.stored.first.name, '我的节点');
       expect(repo.nodesForProfile('p1').any((n) => n.name == 'node-z'), isTrue);
     });
 
@@ -576,9 +576,9 @@ void main() {
       final repo = NodeRepository(store);
       final nodes = [_node('b1'), _node('b2'), _node('b3')];
       final out = repo.insertAll(nodes, nowMs: 10);
-      expect(out, hasLength(3));
-      expect(out.every((n) => n.id.startsWith('n_')), isTrue);
-      expect(out.every((n) => n.updatedAtMs == 10), isTrue);
+      expect(out.stored, hasLength(3));
+      expect(out.stored.every((n) => n.id.startsWith('n_')), isTrue);
+      expect(out.stored.every((n) => n.updatedAtMs == 10), isTrue);
       expect(repo.allNodes(), hasLength(3));
     });
 
@@ -586,34 +586,106 @@ void main() {
       final repo = NodeRepository(store);
       final first = repo.insertAll([_node('b1'), _node('b2')], nowMs: 10);
       final renamed =
-          first.map((n) => n.copyWith(name: '${n.name}-v2')).toList();
+          first.stored.map((n) => n.copyWith(name: '${n.name}-v2')).toList();
       final second = repo.insertAll(renamed, nowMs: 20);
       expect(repo.allNodes(), hasLength(2),
           reason: 'identity is the fingerprint');
       // The second run won and the ids survived.
-      for (final node in second) {
+      for (final node in second.stored) {
         final stored = repo.nodeById(node.id)!;
         expect(stored.name, endsWith('-v2'));
         expect(stored.updatedAtMs, 20);
       }
     });
 
-    test('duplicates inside one batch collapse into a single row', () {
+    test('duplicates inside one batch keep the first occurrence', () {
       final repo = NodeRepository(store);
       final base = _node('dup');
-      // The generated id is n_<fingerprint>, so an in-batch duplicate carries
-      // the same id and collapses via ON CONFLICT(id) — exactly what the
-      // per-row insert path did.
-      repo.insertAll([base, base.copyWith(name: 'dup-renamed')], nowMs: 10);
+      // Identity is deduped at every layer with the same rule the importers
+      // report ("已保留第一条"): first occurrence wins, later ones are
+      // reported as skips instead of silently overwriting the winner.
+      final out =
+          repo.insertAll([base, base.copyWith(name: 'dup-renamed')], nowMs: 10);
       final all = repo.allNodes();
       expect(all, hasLength(1));
-      expect(all.single.name, 'dup-renamed', reason: 'the last write wins');
+      expect(all.single.name, 'node-dup');
+      expect(out.stored, hasLength(1));
+      expect(out.skippedDuplicates, hasLength(1));
+      expect(out.skippedDuplicates.single.sameBatch, isTrue);
+      expect(out.skippedDuplicates.single.node.name, 'dup-renamed');
     });
 
     test('an empty batch is a no-op', () {
       final repo = NodeRepository(store);
-      expect(repo.insertAll(const [], nowMs: 1), isEmpty);
+      expect(repo.insertAll(const [], nowMs: 1).stored, isEmpty);
       expect(repo.allNodes(), isEmpty);
+    });
+
+    test('a connection another profile owns is skipped, not duplicated', () {
+      final repo = NodeRepository(store);
+      repo.insertAll([_node('owned')], nowMs: 10);
+
+      // Same connection, different profile: the paste must not put a second
+      // copy of a node a subscription already carries into the pool.
+      final out = repo.insertAll([
+        _node('owned').copyWith(
+          profileId: 'other-profile',
+          name: '换个名字的同一台服务器',
+        ),
+      ], nowMs: 20);
+
+      expect(out.stored, isEmpty);
+      expect(out.skippedDuplicates, hasLength(1));
+      expect(out.skippedDuplicates.single.sameBatch, isFalse);
+      expect(out.skippedDuplicates.single.ownerProfileId, kLocalProfileId,
+          reason: 'the first import owns the connection');
+      expect(repo.allNodes(), hasLength(1));
+      expect(repo.allNodes().single.name, 'node-owned');
+    });
+
+    test('re-importing into the owning profile still updates in place', () {
+      final repo = NodeRepository(store);
+      final first = repo.insertAll([_node('same')], nowMs: 10);
+      final out = repo.insertAll(
+        [first.stored.single.copyWith(name: 'node-same-v2')],
+        nowMs: 20,
+      );
+      expect(out.stored, hasLength(1));
+      expect(out.skippedDuplicates, isEmpty);
+      expect(repo.allNodes().single.name, 'node-same-v2');
+    });
+  });
+
+  group('replaceProfileNodes (cross-profile identity)', () {
+    test('a refresh skips connections another profile already owns', () {
+      final subs = SubscriptionRepository(store);
+      subs.upsert(const SubscriptionProfile(
+          id: 'p1', name: 'A', url: 'https://example.com/a'));
+      subs.upsert(const SubscriptionProfile(
+          id: 'p2', name: 'B', url: 'https://example.com/b'));
+      final repo = NodeRepository(store);
+
+      // The two aggregators publish the same node; p1 got there first.
+      final shared = _node('shared');
+      repo.replaceProfileNodes('p1', [shared, _node('only-a')], nowMs: 10);
+
+      final out = repo.replaceProfileNodes(
+        'p2',
+        [shared.copyWith(name: 'node-shared-renamed'), _node('only-b')],
+        nowMs: 20,
+      );
+
+      expect(out.stored, hasLength(1), reason: 'only the p2-only node lands');
+      expect(out.stored.single.name, 'node-only-b');
+      expect(out.skippedDuplicates, hasLength(1));
+      expect(out.skippedDuplicates.single.ownerProfileId, 'p1');
+      expect(out.skippedDuplicates.single.node.name, 'node-shared-renamed');
+
+      final all = repo.allNodes();
+      expect(all, hasLength(3), reason: 'shared, only-a, only-b — one copy each');
+      expect(all.where((n) => n.fingerprint == shared.fingerprint), hasLength(1));
+      expect(repo.nodesForProfile('p2').map((n) => n.name),
+          ['node-only-b']);
     });
   });
 }

@@ -102,9 +102,9 @@ type App struct {
 	// cannot race the same adapter. The LocalSystem service is the only
 	// backend; tunSession says whether this host has an enable in flight or a
 	// running core, which is what disable, shutdown and uninstall act on.
-	tunMu        sync.Mutex
-	tunOptions   tunconfig.Options
-	tunSession   bool
+	tunMu      sync.Mutex
+	tunOptions tunconfig.Options
+	tunSession bool
 	// startElevated launches the elevated service installer.
 	// Production leaves it nil and uses elevate.Start; tests replace it, because
 	// the real launcher raises a UAC prompt and a unit test must never do that.
@@ -121,6 +121,11 @@ type App struct {
 	// without spawning sing-box — the port-exclusion rule is about whether the
 	// start is attempted at all.
 	startNormalCore func(configPath string) (int, error)
+	// clearStaleProxy turns off a proxy that still points at our endpoint even
+	// when the snapshot already says it is off. Tests replace it to avoid
+	// touching the developer's real registry.
+	clearStaleProxy func(endpoint string) (bool, error)
+
 	// disableSystemProxy is the registry half of "turn the system proxy off".
 	// Nil means the real restore; tests replace it because writing HKCU\…\
 	// Internet Settings during a unit test would touch the developer's machine.
@@ -187,6 +192,14 @@ type App struct {
 	// exits (or a temp directory is removed) while a probe is still writing.
 	speedWG sync.WaitGroup
 
+	// sess owns what the UI may not own: measurements survive the window that
+	// asked for them. The sampler is started only by the production entry
+	// point, so tests that construct App directly do not inherit a timer.
+	sess            *appSession
+	sessionOnce     sync.Once
+	sessionStop     chan struct{}
+	sessionStopOnce sync.Once
+
 	quitOnce sync.Once
 	quitCh   chan struct{}
 }
@@ -214,6 +227,8 @@ func New(paths Paths, hostVersion string) (*App, error) {
 		Log:         hostLog,
 		Redactor:    redactor,
 		Proxy:       sysproxy.New(),
+		sess:        newAppSession(),
+		sessionStop: make(chan struct{}),
 		quitCh:      make(chan struct{}),
 		// A nil map accepts reads but panics on assignment, so the first probe
 		// that passed `sing-box check` killed the host ("assignment to entry in
@@ -369,14 +384,10 @@ func (a *App) OnClientCount(count int) {
 	a.clientsMu.Lock()
 	a.clients = count
 	a.clientsMu.Unlock()
-	if count == 0 {
-		a.speedMu.Lock()
-		if a.speedCancel != nil {
-			close(a.speedCancel)
-			a.speedCancel = nil
-		}
-		a.speedMu.Unlock()
-	}
+	// A speed test is not a property of the window. Closing the last UI used to
+	// cancel it, which made "close the window and let it finish" impossible even
+	// though the tray and the proxy kept running. The task now survives a zero
+	// client count; its results are read back through session.get.
 	a.Log.Writef("[host] ui clients=%d", count)
 	// Every Store.Update already broadcasts state.changed through the
 	// subscription installed in main.go, so the handler adds nothing here — it
@@ -429,6 +440,9 @@ func (a *App) onCoreExit(restarts int, reason string) {
 // flushes logs. It is safe to call twice.
 func (a *App) Shutdown() {
 	a.Log.Writef("[host] shutting down")
+	// Stop the traffic clock before the log closes. It may still be inside one
+	// connection-list request, but it never writes to the log on that path.
+	a.stopSessionSampler()
 	// Cancel and drain any running probe before touching the log or core so
 	// no goroutine writes after the host's state is finalised.
 	a.speedMu.Lock()
@@ -520,8 +534,14 @@ func (a *App) Dispatch(req *contract.Request) (any, *contract.ErrorObj) {
 		return a.tunServiceUninstall()
 	case contract.ActionSpeedtest:
 		return a.speedtestStart(req)
+	case contract.ActionSpeedtestForget:
+		return a.speedForget(req)
 	case contract.ActionTaskCancel:
 		return a.taskCancel(req)
+	case contract.ActionSessionGet:
+		return a.sessionGet(req)
+	case contract.ActionTrafficGet:
+		return a.trafficGet(req)
 	case contract.ActionLogTail:
 		return a.logTail(req)
 	default:
@@ -1288,6 +1308,16 @@ func (a *App) speedtestStart(req *contract.Request) (any, *contract.ErrorObj) {
 	if len(p.Endpoints) == 0 {
 		return nil, contract.NewError(contract.ErrBadRequest, "endpoints 不能为空")
 	}
+	// The client may omit the metric, and the probe loop infers it from whether
+	// configs were supplied. Record the same answer in the session so a reopened
+	// UI files the result under the metric that was actually measured.
+	if p.Metric == "" {
+		if len(p.Configs) > 0 {
+			p.Metric = metricProxyLatency
+		} else {
+			p.Metric = metricTCP
+		}
+	}
 	a.speedMu.Lock()
 	if a.speedRunning {
 		a.speedMu.Unlock()
@@ -1300,6 +1330,9 @@ func (a *App) speedtestStart(req *contract.Request) (any, *contract.ErrorObj) {
 	a.speedDone = make(chan struct{})
 	a.speedWG.Add(1)
 	a.speedMu.Unlock()
+	if a.sess != nil {
+		a.sess.beginSpeed(p.TaskID, p.Metric, p.NodeIDs, len(p.Endpoints))
+	}
 
 	_, _ = a.Store.Update(func(s *state.Snapshot) { s.SpeedTestRunning = true })
 	a.emit(contract.EventTaskStarted, map[string]any{
@@ -1319,9 +1352,19 @@ func (a *App) runSpeedTest(p speedParams, cancel chan struct{}) {
 		a.speedTaskID = ""
 		close(a.speedDone)
 		a.speedDone = nil
+		if a.sess != nil {
+			a.sess.finishSpeed(p.TaskID)
+		}
 		a.speedMu.Unlock()
 	}()
 	results := a.runProbes(p, cancel)
+	// Progress already stored each terminal result. This second pass covers the
+	// cancellation tail, which has no progress event of its own.
+	if a.sess != nil {
+		for _, result := range results {
+			a.sess.recordSpeed(result)
+		}
+	}
 	event := map[string]any{
 		"taskId": p.TaskID, "results": results,
 	}

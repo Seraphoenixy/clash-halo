@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -74,11 +75,14 @@ func TestPrepareProbeDocumentBindsEgress(t *testing.T) {
 	}
 	outbounds := doc["outbounds"].([]any)
 	direct := outbounds[0].(map[string]any)
-	if direct["bind_interface"] != "WLAN" || direct["inet4_bind_address"] != "192.168.1.20" {
-		t.Fatalf("direct outbound not bound to the physical adapter: %v", direct)
+	if direct["inet4_bind_address"] != "192.168.1.20" {
+		t.Fatalf("direct outbound not bound to the physical address: %v", direct)
+	}
+	if _, ok := direct["bind_interface"]; ok {
+		t.Fatal("bind_interface must stay out: it breaks the direct outbound under TUN")
 	}
 	block := outbounds[1].(map[string]any)
-	if _, ok := block["bind_interface"]; ok {
+	if _, ok := block["inet4_bind_address"]; ok {
 		t.Fatal("block outbound must not gain dial fields")
 	}
 	route := doc["route"].(map[string]any)
@@ -194,6 +198,40 @@ func mustUDPAddr(t *testing.T, raw string) *net.UDPAddr {
 	return addr
 }
 
+// TestDNSRelayPublicUnderTun checks the relay against the physical resolver,
+// not only the loopback upstream used by the unit test.
+func TestDNSRelayPublicUnderTun(t *testing.T) {
+	if os.Getenv("HALO_PROBE_EGRESS_NET") != "1" {
+		t.Skip("set HALO_PROBE_EGRESS_NET=1 to run the networked DNS test")
+	}
+	adapter := strings.TrimSpace(os.Getenv("HALO_PROBE_EGRESS_EXCLUDE"))
+	if adapter == "" {
+		t.Skip("set HALO_PROBE_EGRESS_EXCLUDE to the live TUN adapter name")
+	}
+	egress, err := discoverProbeEgress(adapter)
+	if err != nil {
+		t.Skipf("no physical egress: %v", err)
+	}
+	relay, err := startDoHRelay(egress)
+	if err != nil {
+		t.Fatalf("dns relay: %v", err)
+	}
+	defer relay.Close()
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			return net.Dial("udp4", relay.Addr())
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	ips, err := resolver.LookupHost(ctx, "www.baidu.com")
+	if err != nil {
+		t.Fatalf("relay lookup via %s failed: %v", egress.DNS, err)
+	}
+	t.Logf("relay via %s -> %v", egress.DNS, ips)
+}
+
 // TestProbeConfigThroughPhysicalEgress exercises the actual binding support in
 // the pinned core. It needs the network, so it is opt-in.
 func TestProbeConfigThroughPhysicalEgress(t *testing.T) {
@@ -202,23 +240,122 @@ func TestProbeConfigThroughPhysicalEgress(t *testing.T) {
 	}
 	core := testCorePath(t)
 	a := &App{Paths: DefaultPaths(t.TempDir(), core)}
-	egress, err := discoverProbeEgress("")
+	// A live TUN adapter is not necessarily reported as IF_TYPE_TUNNEL on
+	// Windows, so the caller must name it. The real probe path gets the name
+	// from the snapshot or the runtime config; this opt-in test takes it from
+	// the environment so a TUN-active run cannot silently select the tunnel.
+	exclude := strings.TrimSpace(os.Getenv("HALO_PROBE_EGRESS_EXCLUDE"))
+	egress, err := discoverProbeEgress(exclude)
 	if err != nil {
 		t.Skipf("no physical egress: %v", err)
 	}
-	relay, err := startDNSRelay(egress)
+	relay, err := startDoHRelay(egress)
 	if err != nil {
 		t.Fatalf("dns relay: %v", err)
 	}
 	defer relay.Close()
 	egress.DNSListen = relay.Addr()
+	t.Logf("egress %s (%s) dns=%s relay=%s", egress.Name, egress.IPv4, egress.DNS, relay.Addr())
 
+	target := strings.TrimSpace(os.Getenv("HALO_PROBE_URL"))
+	if target == "" {
+		target = "https://www.gstatic.com/generate_204"
+	}
 	config := `{"outbounds":[{"type":"direct","tag":"direct"}]}`
-	result := a.probeConfig(config, "https://www.gstatic.com/generate_204", 12*time.Second, probeBodyLimit, metricProxyLatency, make(chan struct{}), egress)
+	result := a.probeConfig(config, target, 12*time.Second, probeBodyLimit, metricProxyLatency, make(chan struct{}), egress)
 	if !result.Ok {
 		t.Fatalf("probe through %s (%s) failed: %+v", egress.Name, egress.IPv4, result)
 	}
 	t.Logf("egress %s (%s): %d ms", egress.Name, egress.IPv4, result.LatencyMs)
+}
+
+// This is the full runProbes path with TUN marked active: discovery, DNS relay,
+// physical binding and the disposable core. The live TUN adapter name comes
+// from the environment so the test can run while a real tunnel is up.
+func TestTunBypassRunsProbeWithRealTun(t *testing.T) {
+	if os.Getenv("HALO_PROBE_EGRESS_NET") != "1" {
+		t.Skip("set HALO_PROBE_EGRESS_NET=1 to run the networked TUN test")
+	}
+	adapter := strings.TrimSpace(os.Getenv("HALO_PROBE_EGRESS_EXCLUDE"))
+	if adapter == "" {
+		t.Skip("set HALO_PROBE_EGRESS_EXCLUDE to the live TUN adapter name")
+	}
+	a := newTestApp(t)
+	_, _ = a.Store.Update(func(s *state.Snapshot) {
+		s.TunState = state.TunEnabled
+		s.TunAdapter = adapter
+	})
+	target := strings.TrimSpace(os.Getenv("HALO_PROBE_URL"))
+	if target == "" {
+		target = "https://www.gstatic.com/generate_204"
+	}
+	p := speedParams{
+		Metric:    metricProxyLatency,
+		URL:       target,
+		Endpoints: []string{"probe"},
+		NodeIDs:   []string{"n1"},
+		Configs:   []string{`{"outbounds":[{"type":"direct","tag":"direct"}]}`},
+	}
+	results := a.runProbes(p, make(chan struct{}))
+	if len(results) != 1 || !results[0].Ok {
+		t.Fatalf("TUN bypass probe failed: %+v", results)
+	}
+	t.Logf("TUN bypass probe through %s: %d ms", adapter, results[0].LatencyMs)
+}
+
+// The raw TCP probe has no disposable core; it resolves through the same DoH
+// relay and binds the same physical source.
+func TestTunBypassRawTCPWithRealTun(t *testing.T) {
+	if os.Getenv("HALO_PROBE_EGRESS_NET") != "1" {
+		t.Skip("set HALO_PROBE_EGRESS_NET=1 to run the networked TUN test")
+	}
+	adapter := strings.TrimSpace(os.Getenv("HALO_PROBE_EGRESS_EXCLUDE"))
+	if adapter == "" {
+		t.Skip("set HALO_PROBE_EGRESS_EXCLUDE to the live TUN adapter name")
+	}
+	a := newTestApp(t)
+	_, _ = a.Store.Update(func(s *state.Snapshot) {
+		s.TunState = state.TunEnabled
+		s.TunAdapter = adapter
+	})
+	p := speedParams{
+		Metric:    metricTCP,
+		Endpoints: []string{"www.baidu.com:443"},
+		NodeIDs:   []string{"n1"},
+	}
+	results := a.runProbes(p, make(chan struct{}))
+	if len(results) != 1 || !results[0].Ok {
+		t.Fatalf("TUN bypass raw TCP failed: %+v", results)
+	}
+	t.Logf("TUN bypass raw TCP through %s: %d ms", adapter, results[0].LatencyMs)
+}
+
+// The download path uses the same physical source and DoH relay as latency.
+func TestTunBypassDownloadWithRealTun(t *testing.T) {
+	if os.Getenv("HALO_PROBE_EGRESS_NET") != "1" {
+		t.Skip("set HALO_PROBE_EGRESS_NET=1 to run the networked TUN test")
+	}
+	adapter := strings.TrimSpace(os.Getenv("HALO_PROBE_EGRESS_EXCLUDE"))
+	if adapter == "" {
+		t.Skip("set HALO_PROBE_EGRESS_EXCLUDE to the live TUN adapter name")
+	}
+	a := newTestApp(t)
+	_, _ = a.Store.Update(func(s *state.Snapshot) {
+		s.TunState = state.TunEnabled
+		s.TunAdapter = adapter
+	})
+	p := speedParams{
+		Metric:    metricDownload,
+		URL:       defaultSpeedURL,
+		Endpoints: []string{"probe"},
+		NodeIDs:   []string{"n1"},
+		Configs:   []string{`{"outbounds":[{"type":"direct","tag":"direct"}]}`},
+	}
+	results := a.runProbes(p, make(chan struct{}))
+	if len(results) != 1 || !results[0].Ok || results[0].DownloadBps <= 0 {
+		t.Fatalf("TUN bypass download failed: %+v", results)
+	}
+	t.Logf("TUN bypass download through %s: %d B/s", adapter, results[0].DownloadBps)
 }
 
 // A configured probe must not dial the active proxy. This is behavioral, not
@@ -263,9 +400,22 @@ func TestProbeConfigDoesNotDialActiveProxy(t *testing.T) {
 	}
 }
 
+// The shipped build must enable the bypass: this is the requirement that
+// node ranking measures the node, not the current tunnel.
+func TestTunBypassEnabledByDefault(t *testing.T) {
+	if !probeTunBypassEnabled {
+		t.Fatal("TUN measurement bypass is disabled")
+	}
+}
+
 // While the bypass is disabled, a TUN-active run is refused rather than
-// measured through the tunnel.
+// measured through the tunnel. The default is enabled; this test overrides it
+// to keep the refusal path covered for builds that turn it off.
 func TestTunActiveWithoutBypassRefusesMeasurement(t *testing.T) {
+	old := probeTunBypassEnabled
+	probeTunBypassEnabled = false
+	t.Cleanup(func() { probeTunBypassEnabled = old })
+
 	a := newTestApp(t)
 	_, _ = a.Store.Update(func(s *state.Snapshot) {
 		s.TunState = state.TunEnabled

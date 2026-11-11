@@ -90,7 +90,7 @@ class UnlockPage extends StatelessWidget {
                       '所以下面的结果描述的是本机出口而不是节点。'
                       '请先切到「规则」或「全局」模式再检测。',
                 ),
-              if (unlock.staleFor(c.snapshot?.activeNodeId))
+              if (unlock.staleFor(c.activeNodeId))
                 _Notice(
                   // The verdicts belong to an exit, so a node switch makes them
                   // describe the previous node. Saying so beats both silently
@@ -148,14 +148,7 @@ class UnlockPage extends StatelessWidget {
   }
 }
 
-String? _activeNodeName(AppController c) {
-  final id = c.snapshot?.activeNodeId;
-  if (id == null || id.isEmpty) return null;
-  for (final node in c.loadNodes()) {
-    if (node.id == id) return node.name;
-  }
-  return null;
-}
+String? _activeNodeName(AppController c) => c.activeNodeName;
 
 /// Colour for a verdict category.
 ///

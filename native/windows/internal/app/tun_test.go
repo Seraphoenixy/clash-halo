@@ -38,6 +38,8 @@ func newTunTestApp(t *testing.T) *App {
 	// The fake service reports the test process's pid, which is alive; tests
 	// that need "the core died" replace this.
 	a.tunAlive = func(pid int) bool { return pid != 0 }
+	// Never touch the developer's real proxy registry from these tests.
+	a.clearStaleProxy = func(string) (bool, error) { return false, nil }
 	t.Cleanup(a.Shutdown)
 	return a
 }
@@ -687,6 +689,35 @@ func TestRestoreNormalCoreDeclinesWhileTunnelHoldsThePort(t *testing.T) {
 	a.restoreNormalCore()
 	if starts != 2 {
 		t.Fatalf("starts = %d, want the core restored after the tunnel failed", starts)
+	}
+}
+
+func TestTunClearsStaleSystemProxy(t *testing.T) {
+	a := newTunTestApp(t)
+	called := 0
+	a.clearStaleProxy = func(endpoint string) (bool, error) {
+		called++
+		if endpoint != "127.0.0.1:7890" {
+			t.Fatalf("endpoint = %q", endpoint)
+		}
+		return true, nil
+	}
+	_, _ = a.Store.Update(func(s *state.Snapshot) {
+		s.TunState = state.TunEnabled
+		s.SystemProxy = state.SystemProxy{
+			Supported: true,
+			Enabled:   false,
+			Endpoint:  "127.0.0.1:7890",
+		}
+	})
+
+	a.tunTakesOverSystemProxy()
+
+	if called != 1 {
+		t.Fatalf("clear calls = %d, want 1", called)
+	}
+	if a.Store.Snapshot().SystemProxy.Enabled {
+		t.Fatal("stale proxy must be recorded as off")
 	}
 }
 
