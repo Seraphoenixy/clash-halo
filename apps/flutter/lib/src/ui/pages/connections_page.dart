@@ -527,45 +527,66 @@ class _ConnectionsPageState extends State<ConnectionsPage> {
         children: [
           _SpeedStrip(throughput: c.throughput),
           const SizedBox(height: HaloMetrics.blockGap),
-          Row(
-            children: [
-              SizedBox(
-                width: 280,
-                child: TextField(
-                  controller: _search,
-                  focusNode: _searchFocus,
-                  onChanged: (v) => setState(() {
-                    _query = v.trim();
-                    _visibleCache = null;
-                  }),
-                  decoration: InputDecoration(
-                    hintText: haloTouchPlatform(context)
-                        ? '搜索主机、进程、规则或代理链'
-                        : '搜索主机、进程、规则或代理链（Ctrl+F）',
-                    prefixIcon: const Icon(Icons.search, size: 16),
-                  ),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final search = TextField(
+                controller: _search,
+                focusNode: _searchFocus,
+                onChanged: (v) => setState(() {
+                  _query = v.trim();
+                  _visibleCache = null;
+                }),
+                decoration: InputDecoration(
+                  hintText: haloTouchPlatform(context)
+                      ? '搜索主机、进程、规则或代理链'
+                      : '搜索主机、进程、规则或代理链（Ctrl+F）',
+                  prefixIcon: const Icon(Icons.search, size: 16),
                 ),
-              ),
-              const SizedBox(width: 10),
-              Flexible(
-                child: Text(
-                  _query.isEmpty
-                      ? '每 1.5 秒刷新'
-                      : '${visible.length} / ${_connections.length} 条匹配',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(fontSize: 11.5, color: p.textSecondary),
-                ),
-              ),
-              const Spacer(),
-              if (_controllerName.isNotEmpty)
-                // Showing the source is how a stale list is told from an empty
-                // one after changing the API port.
-                Text(
-                  '控制器 $_controllerName',
-                  style: TextStyle(fontSize: 11, color: p.textTertiary),
-                ),
-            ],
+              );
+              final status = Text(
+                _query.isEmpty
+                    ? '每 1.5 秒刷新'
+                    : '${visible.length} / ${_connections.length} 条匹配',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11.5, color: p.textSecondary),
+              );
+              final controller = _controllerName.isEmpty
+                  ? null
+                  : Text(
+                      '控制器 $_controllerName',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 11, color: p.textTertiary),
+                    );
+              if (constraints.maxWidth < 560) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    search,
+                    const SizedBox(height: HaloMetrics.lineGap),
+                    Row(
+                      children: [
+                        Expanded(child: status),
+                        if (controller != null) ...[
+                          const SizedBox(width: 8),
+                          Flexible(child: controller),
+                        ],
+                      ],
+                    ),
+                  ],
+                );
+              }
+              return Row(
+                children: [
+                  SizedBox(width: 280, child: search),
+                  const SizedBox(width: 10),
+                  Flexible(child: status),
+                  const Spacer(),
+                  ?controller,
+                ],
+              );
+            },
           ),
           // The empty state already says the core is down; a red banner with
           // the same sentence above it reads as two different faults.
@@ -746,35 +767,58 @@ class _SpeedStrip extends StatelessWidget {
         border: Border.all(color: p.border),
         borderRadius: BorderRadius.circular(HaloMetrics.radius),
       ),
-      child: Row(
-        children: [
-          figure('上行', up, p.accent, Icons.arrow_upward),
-          const SizedBox(width: 20),
-          figure(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final compact = constraints.maxWidth < 560;
+          final upFigure = figure('上行', up, p.accent, Icons.arrow_upward);
+          final downFigure = figure(
             '下行',
             down,
             HaloColors.adapt(HaloColors.success, p.isDark),
             Icons.arrow_downward,
-          ),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Sparkline(
-              samples: throughput.history,
-              up: p.accent,
-              down: HaloColors.adapt(HaloColors.success, p.isDark),
-              grid: p.border,
-              // An empty chart used to draw its baseline across the strip,
-              // which read as a divider rather than as "no sample yet".
-              placeholder: throughput.hasCurve ? null : '等待采样…',
-            ),
-          ),
-          const SizedBox(width: 12),
-          Text(
+          );
+          final peak = Text(
             '峰值 ↑${rateLabel(throughput.peakUp)} '
             '↓${rateLabel(throughput.peakDown)}',
             style: TextStyle(fontSize: 11, color: p.textTertiary),
-          ),
-        ],
+          );
+          final chart = Sparkline(
+            samples: throughput.history,
+            up: p.accent,
+            down: HaloColors.adapt(HaloColors.success, p.isDark),
+            grid: p.border,
+            // An empty chart used to draw its baseline across the strip,
+            // which read as a divider rather than as "no sample yet".
+            placeholder: throughput.hasCurve ? null : '等待采样…',
+          );
+          if (compact) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    Expanded(child: upFigure),
+                    const SizedBox(width: 12),
+                    Expanded(child: downFigure),
+                  ],
+                ),
+                const SizedBox(height: 2),
+                peak,
+              ],
+            );
+          }
+          return Row(
+            children: [
+              upFigure,
+              const SizedBox(width: 20),
+              downFigure,
+              const SizedBox(width: 16),
+              Expanded(child: chart),
+              const SizedBox(width: 12),
+              peak,
+            ],
+          );
+        },
       ),
     );
   }
@@ -1117,20 +1161,35 @@ class _StatusStrip extends StatelessWidget {
       if (selected > 0) '已选 $selected',
       if (busy) '处理中…',
     ];
-    return Row(
-      children: [
-        Text(
-          parts.join(' · '),
-          style: TextStyle(fontSize: 11.5, color: p.textSecondary),
-        ),
-        const Spacer(),
-        Text(
-          haloTouchPlatform(context)
-              ? '长按连接打开菜单 · 点按选择'
-              : 'Ctrl+A 全选 · Delete 关闭 · Ctrl+F 搜索 · F5 刷新',
-          style: TextStyle(fontSize: 11, color: p.textTertiary),
-        ),
-      ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxWidth < 560;
+        final touch = haloTouchPlatform(context);
+        final hint = touch
+            ? (compact ? '长按打开菜单' : '长按连接打开菜单 · 点按选择')
+            : (compact ? '' : 'Ctrl+A 全选 · Delete 关闭 · Ctrl+F 搜索 · F5 刷新');
+        return Row(
+          children: [
+            Expanded(
+              child: Text(
+                parts.join(' · '),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11.5, color: p.textSecondary),
+              ),
+            ),
+            if (hint.isNotEmpty) ...[
+              const SizedBox(width: 8),
+              Text(
+                hint,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11, color: p.textTertiary),
+              ),
+            ],
+          ],
+        );
+      },
     );
   }
 }

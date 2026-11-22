@@ -44,12 +44,19 @@ void main() {
     });
   }
 
+  void useDesktopViewport(WidgetTester tester) {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+  }
+
   testWidgets('a store failure does not throw out of the root widget',
       (tester) async {
     blockedStore();
     await controller.start(connectHost: false);
     expect(controller.storeReady, isFalse);
     expect(controller.storeError, isNotNull);
+    useDesktopViewport(tester);
 
     // The original defect: this threw `Bad state: 数据库不可用` from initState.
     await tester.pumpWidget(HaloRoot(controller: controller));
@@ -63,6 +70,7 @@ void main() {
       (tester) async {
     blockedStore();
     await controller.start(connectHost: false);
+    useDesktopViewport(tester);
 
     await tester.pumpWidget(
       MaterialApp(

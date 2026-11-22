@@ -96,10 +96,15 @@ halo-host.exe（普通权限）
 2. **gvisor 承载全部 TCP**。宿主的默认 TUN 选项固定 `stack: gvisor`，所有 TCP 都
    经过用户态网络栈。sing-box 对 `mixed` 的定义是 TCP 走系统栈、UDP 走 gvisor，
    吞吐与单连接 CPU 成本都优于 gvisor。
-3. **TUN 下的 DNS 走代理 DoH**。生成的配置里 `dns.final = remote`，`remote` 是带
-   `detour: proxy` 的 DoH。系统代理模式下应用自己解析 DNS（直连），TUN 模式下
-   每次解析都要经过节点；日志里可见 257 ms 与 1.65 s 的解析。这不是错误，而是
-   两种模式下可感知的性能差异，也是 Clash Verge 用 fake-ip 规避的部分。
+3. **TUN 下的 DNS 走代理 DoH**。旧配置的 `dns.final = remote`，`remote` 是带
+   `detour: proxy` 的 DoH。TUN 接管所有应用后，每个未缓存域名都要先经节点；本机
+   实测冷解析 80–628 ms，项目日志曾出现 257 ms 与 1.65 s。现在默认开启 Fake-IP，
+   DNS 立即返回合成地址，连接进入路由前再还原为域名；不使用 Fake-IP 时仍保持旧
+   远程 DoH 行为。`geoip-*` 与用户 `ip_cidr` 规则前会插入 `resolve`，只在规则确实
+   需要目的 IP 时解析，域名规则不承担额外查询。
+4. **全局嗅探有固定等待上限**。`sniff` 放在所有规则之前时，规则未识别出 TLS、
+   HTTP 或 QUIC 的短首包会一直等到超时。隔离测试中 300 ms 超时稳定产生
+   300.60–301.43 ms 首字节延迟；关闭嗅探后为 0.22–0.95 ms。
 
 ## 4. 本轮已完成的修复
 
@@ -116,8 +121,12 @@ halo-host.exe（普通权限）
 | `internal/tunsup` | 就绪判定改为“适配器存在”（可注入 probe），不再依赖 INFO 日志；日志轮转，单文件上限 8 MiB | `TestControllerStartStop` |
 | `internal/app` | 不再改写 `log.level`；保留用户设置 | 代码审阅 + 配置测试 |
 | `internal/tunconfig`、`packages/config`、fixture | 默认 `stack` 由 `gvisor` 改为 `mixed` | Go fixture parity、Dart tun 测试；`sing-box 1.14.4 check` 接受 |
+| `packages/config`、`apps/flutter` | 默认启用 Fake-IP（`198.18.0.0/15`）；A/AAAA 查询立即返回合成地址，缓存文件持久化映射，设置页可关闭 | 配置层测试、设置页测试、真实 `sing-box 1.14.4 check` |
+| `packages/config` | `sniff` 移到 DNS、私网和确定直连规则之后，并把超时从 300 ms 降到 100 ms | 规则顺序测试、反向验证、隔离首字节测试 |
+| `packages/config`、`apps/flutter` | 设置页可维护额外局域网 IPv4/IPv6 CIDR；把列表写成所有路由模式都优先命中的直连规则，空列表不产生规则 | 设置页校验/持久化测试、配置顺序测试、真实 `sing-box check` |
 
-未做：DNS 改为 fake-ip 或本地解析。它影响泄漏与分流语义，需要单独设计。
+Fake-IP 默认开启；依赖真实 DNS 结果的个别应用可以在设置中关闭。关闭后恢复为
+远程 DoH 解析，分流语义不变但重新承担节点 DNS 往返。
 
 ## 5. Clash Verge Rev 的做法（调研结论）
 

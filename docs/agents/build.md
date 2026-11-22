@@ -35,14 +35,15 @@ pwsh -NoProfile -File scripts/fetch-singbox.ps1 -VerifyOnly   # 只检查，不�
 ## 持续集成
 
 [.github/workflows/build.yml](../.github/workflows/build.yml)，与 `D:\project\Ygdria`
-的 workflow 同构（`metadata → verify → windows → release`）：
+的 workflow 同构（`metadata → verify → windows/android → release`）：
 
 | job | 触发 | 做什么 |
 | --- | --- | --- |
 | `metadata` | tag / 手动 | 读 `apps/flutter/pubspec.yaml` 的版本，剥掉 `+build`；tag 与它不一致就报错 |
-| `verify` | tag / 手动 | Go 与 Flutter 全量测试（含 `apps/flutter` 的 330 项） |
+| `verify` | 所有 push / PR | Go 与 Flutter 全量测试（含 `apps/flutter` 的 330 项） |
 | `windows` | tag / 手动 | `scripts/fetch-singbox.ps1` → `scripts/build-installer.ps1` → 校验载荷与版本 → 上传 |
-| `release` | tag | 创建 **draft** release（安装包未签名，先起草再人工发布） |
+| `android` | tag / 手动 | 从锁定的 sing-box commit 构建 arm64 libbox → 构建 APK → 校验 ABI 载荷 → 上传 APK 与 SHA-256 |
+| `release` | tag | 创建 **draft** release，同时附上 Windows 安装包、Android APK 与校验文件（安装包未签名，先起草再人工发布） |
 
 与参考项目不同的三处，都是本项目的形态决定的：
 

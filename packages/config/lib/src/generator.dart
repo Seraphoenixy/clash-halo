@@ -91,6 +91,9 @@ class DnsSettings {
   );
 }
 
+const String kFakeIpv4Range = '198.18.0.0/15';
+const String kFakeIpv6Range = '2001:2::/48';
+
 class TunSettings {
   const TunSettings({
     this.enabled = false,
@@ -138,6 +141,7 @@ class ConfigRequest {
     this.logLevel = 'warn',
     this.testPort,
     this.rules = const [],
+    this.lanCidrs = const [],
   });
 
   final ProxyNode node;
@@ -157,6 +161,12 @@ class ConfigRequest {
   /// and honouring them there would make the mode selector lie about what it
   /// does.
   final List<RoutingRule> rules;
+
+  /// Destination CIDRs that always bypass the proxy.
+  ///
+  /// Unlike [rules], this whitelist applies in every route mode and is emitted
+  /// before the mode-specific rules. Callers validate each entry as an IP CIDR.
+  final List<String> lanCidrs;
 }
 
 class GeneratedConfig {
@@ -267,11 +277,22 @@ ConfigBuildResult buildConfig(ConfigRequest request, CoreCapabilities caps) {
       // connection fails. Pinning the server name to the direct resolver
       // breaks the cycle.
       if (_domainOf(request.node.server) case final server?)
-        {'domain': [server], 'server': 'local'},
+        {
+          'domain': [server],
+          'server': 'local',
+        },
       // An empty successful response suppresses AAAA records without making
       // system resolvers retry a refused query.
       if (!request.dns.ipv6)
         {'ip_version': 6, 'action': 'predefined', 'rcode': 'NOERROR'},
+      // Return a synthetic address immediately instead of waiting for the
+      // proxied DoH round trip on every uncached domain. The route restores
+      // this address to the original domain before applying its rules.
+      if (request.dns.fakeAddress)
+        {
+          'query_type': ['A', if (request.dns.ipv6) 'AAAA'],
+          'server': 'fakeip',
+        },
     ];
     doc['dns'] = {
       'servers': [
@@ -283,6 +304,13 @@ ConfigBuildResult buildConfig(ConfigRequest request, CoreCapabilities caps) {
         // on startup — every generated config failed to run. This resolver is
         // kept on the direct path by the ip rule in [_routeRules] instead.
         _dnsServer(tag: 'local', url: request.dns.directServer),
+        if (request.dns.fakeAddress)
+          {
+            'type': 'fakeip',
+            'tag': 'fakeip',
+            'inet4_range': kFakeIpv4Range,
+            if (request.dns.ipv6) 'inet6_range': kFakeIpv6Range,
+          },
       ],
       'final': 'remote',
       if (dnsRules.isNotEmpty) 'rules': dnsRules,
@@ -291,7 +319,11 @@ ConfigBuildResult buildConfig(ConfigRequest request, CoreCapabilities caps) {
   }
 
   final experimental = <String, Object?>{
-    'cache_file': {'enabled': true, 'path': 'halo-cache.db'},
+    'cache_file': {
+      'enabled': true,
+      'path': 'halo-cache.db',
+      if (request.dns.fakeAddress) 'store_fakeip': true,
+    },
   };
   if (request.ports.enableClashApi) {
     experimental['clash_api'] = {
@@ -343,17 +375,7 @@ List<Map<String, Object?>> _ruleSetsFor(ConfigRequest request) {
 }
 
 List<Map<String, Object?>> _routeRules(ConfigRequest request) {
-  final rules = <Map<String, Object?>>[
-    // TUN connections arrive with only the destination IP. The host column and
-    // every domain-based rule set need the domain carried in TLS SNI, HTTP
-    // Host or QUIC SNI, so sniffing must run before all matchers. This action
-    // only records metadata; the outbound still comes from the rules below.
-    const {
-      'action': 'sniff',
-      'sniffer': ['tls', 'http', 'quic'],
-      'timeout': '300ms',
-    },
-  ];
+  final rules = <Map<String, Object?>>[];
   // The local resolver carries no detour (see buildConfig), so its own traffic
   // must be pinned to the direct outbound by destination. Routing it through
   // the proxy would make the proxy resolve its own server name.
@@ -366,9 +388,15 @@ List<Map<String, Object?>> _routeRules(ConfigRequest request) {
       });
     }
   }
+  // A LAN allowlist is an explicit bypass, so it also applies in global mode.
+  // Keeping it before sniff avoids a needless 100ms wait for local traffic.
+  if (request.lanCidrs.isNotEmpty) {
+    rules.add({'ip_cidr': request.lanCidrs, 'outbound': 'direct'});
+  }
   switch (request.mode) {
     case RouteMode.direct:
     case RouteMode.global:
+      rules.add(_sniffRule);
       return rules;
     case RouteMode.rule:
       rules.addAll(const [
@@ -377,6 +405,11 @@ List<Map<String, Object?>> _routeRules(ConfigRequest request) {
         {'protocol': 'dns', 'outbound': 'direct'},
         {'clash_mode': 'direct', 'outbound': 'direct'},
       ]);
+      // TUN connections arrive with only the destination IP. Resolve the
+      // deterministic direct cases above before waiting for a protocol sample;
+      // otherwise DNS and LAN traffic can pay the full sniff timeout even
+      // though their outbound is already known.
+      rules.add(_sniffRule);
       // User rules sit after the non-negotiables above and before the final
       // outbound. They must come after the private-network rule: putting a
       // user rule first would let a broad "direct everything" entry shadow
@@ -384,11 +417,30 @@ List<Map<String, Object?>> _routeRules(ConfigRequest request) {
       // which cannot reach 192.168.x.x) looks like the proxy is broken.
       for (final rule in request.rules) {
         final document = ruleToDocument(rule);
-        if (document != null) rules.add(document);
+        if (document != null) {
+          if (request.dns.enabled &&
+              request.dns.fakeAddress &&
+              _needsResolvedDestination(rule)) {
+            rules.add(_resolveRule);
+          }
+          rules.add(document);
+        }
       }
       return rules;
   }
 }
+
+bool _needsResolvedDestination(RoutingRule rule) =>
+    rule.kind == RuleKind.ipCidr ||
+    (rule.kind == RuleKind.ruleSet && rule.value.trim().startsWith('geoip-'));
+
+const Map<String, Object?> _resolveRule = {'action': 'resolve'};
+
+const Map<String, Object?> _sniffRule = {
+  'action': 'sniff',
+  'sniffer': ['tls', 'http', 'quic'],
+  'timeout': '100ms',
+};
 
 final _ipv4Pattern = RegExp(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$');
 

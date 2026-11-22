@@ -30,11 +30,7 @@ class HaloApp extends StatefulWidget {
 class _HaloAppState extends State<HaloApp> {
   HaloPage _page = HaloPage.overview;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
-  bool _sidebarCollapsed = false;
-
-  /// Below this the rail does not fit beside a usable page: it becomes a
-  /// drawer and the header gets a menu button.
-  static const double _compactBreakpoint = 760;
+  bool? _sidebarCollapsedPreference;
 
   AppController get controller => widget.controller;
 
@@ -83,7 +79,7 @@ class _HaloAppState extends State<HaloApp> {
     final content = _buildContent();
     return LayoutBuilder(
       builder: (context, constraints) {
-        final compact = constraints.maxWidth < _compactBreakpoint;
+        final compact = constraints.maxWidth < HaloMetrics.drawerBreakpoint;
         if (compact) {
           return Scaffold(
             key: _scaffoldKey,
@@ -91,7 +87,11 @@ class _HaloAppState extends State<HaloApp> {
               width: HaloMetrics.sidebarWidth,
               child: SafeArea(
                 bottom: false,
-                child: _buildSidebar(compact: true, closeDrawer: true),
+                child: _buildSidebar(
+                  compact: true,
+                  closeDrawer: true,
+                  collapsed: false,
+                ),
               ),
             ),
             body: SafeArea(
@@ -102,10 +102,17 @@ class _HaloAppState extends State<HaloApp> {
             ),
           );
         }
+        final collapsed =
+            _sidebarCollapsedPreference ??
+            constraints.maxWidth < HaloMetrics.desktopRailBreakpoint;
         return SafeArea(
           child: Row(
             children: [
-              _buildSidebar(compact: false, closeDrawer: false),
+              _buildSidebar(
+                compact: false,
+                closeDrawer: false,
+                collapsed: collapsed,
+              ),
               Expanded(child: content),
             ],
           ),
@@ -116,7 +123,11 @@ class _HaloAppState extends State<HaloApp> {
 
   /// The sidebar listens to connection, runtime and catalog revisions because
   /// its footer and the attention dot change on all three.
-  Widget _buildSidebar({required bool compact, required bool closeDrawer}) {
+  Widget _buildSidebar({
+    required bool compact,
+    required bool closeDrawer,
+    required bool collapsed,
+  }) {
     return ValueListenableBuilder<int>(
       valueListenable: controller.connectionRevision,
       builder: (context, _, _) => ValueListenableBuilder<int>(
@@ -140,11 +151,12 @@ class _HaloAppState extends State<HaloApp> {
                   : (controller.snapshot?.coreState.isRunning ?? false),
               isAndroid: isAndroid,
               compact: compact,
-              collapsed: !compact && _sidebarCollapsed,
+              collapsed: collapsed,
               onToggle: compact
                   ? null
-                  : () =>
-                        setState(() => _sidebarCollapsed = !_sidebarCollapsed),
+                  : () => setState(
+                      () => _sidebarCollapsedPreference = !collapsed,
+                    ),
               blockedPage: step == null ? null : HaloPage.forStep(step.page),
             );
           },
@@ -379,140 +391,149 @@ class HaloPageScaffold extends StatelessWidget {
   final double? maxContentWidth;
   final Widget child;
 
-  /// Keep in sync with [_HaloAppState._compactBreakpoint].
-  static const double compactBreakpoint = 760;
+  static const double compactBreakpoint = HaloMetrics.compactPageBreakpoint;
 
   @override
   Widget build(BuildContext context) {
-    final p = HaloPalette.of(context);
-    final text = Theme.of(context).textTheme;
-    final menu = HaloPageMenu.maybeOf(context);
-    final compact = MediaQuery.sizeOf(context).width < compactBreakpoint;
-    final horizontal = compact ? 8.0 : HaloMetrics.contentPadding;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final p = HaloPalette.of(context);
+        final text = Theme.of(context).textTheme;
+        final menu = HaloPageMenu.maybeOf(context);
+        final compact =
+            menu != null || constraints.maxWidth < compactBreakpoint;
+        final horizontal = compact ? 8.0 : HaloMetrics.contentPadding;
 
-    final titleBlock = Column(
-      mainAxisSize: MainAxisSize.min,
-      mainAxisAlignment: MainAxisAlignment.center,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-          style: text.titleLarge,
-        ),
-        if (subtitle != null)
-          Padding(
-            padding: const EdgeInsets.only(top: 1),
-            child: Text(
-              subtitle!,
+        final titleBlock = Column(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: text.bodySmall,
+              style: text.titleLarge,
             ),
-          ),
-      ],
-    );
+            if (subtitle != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 1),
+                child: Text(
+                  subtitle!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: text.bodySmall,
+                ),
+              ),
+          ],
+        );
 
-    final actionRow = actions.isEmpty
-        ? null
-        : Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              for (final action in actions) ...[
-                const SizedBox(width: 8),
-                action,
-              ],
-            ],
-          );
+        final actionRow = actions.isEmpty
+            ? null
+            : Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (final action in actions) ...[
+                    const SizedBox(width: 8),
+                    action,
+                  ],
+                ],
+              );
 
-    // Touch platforms get the larger action targets even in the wide header;
-    // a tablet with a mouse still benefits, and a desktop window keeps 32 px.
-    final touch = haloTouchPlatform(context);
-    final themedActions = actionRow == null
-        ? null
-        : (compact || touch)
-        ? _compactActionTheme(context, actionRow)
-        : actionRow;
+        // Touch platforms get the larger action targets even in the wide header;
+        // a tablet with a mouse still benefits, and a desktop window keeps 32 px.
+        final touch = haloTouchPlatform(context);
+        final themedActions = actionRow == null
+            ? null
+            : (compact || touch)
+            ? _compactActionTheme(context, actionRow)
+            : actionRow;
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Container(
-          constraints: BoxConstraints(
-            minHeight: compact ? 92 : HaloMetrics.pageHeaderHeight,
-          ),
-          padding: EdgeInsets.fromLTRB(
-            horizontal,
-            compact ? 6 : 0,
-            horizontal,
-            compact ? 6 : 0,
-          ),
-          decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: p.border)),
-          ),
-          child: compact
-              ? Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Row(
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Container(
+              constraints: BoxConstraints(
+                minHeight: compact ? 92 : HaloMetrics.pageHeaderHeight,
+              ),
+              padding: EdgeInsets.fromLTRB(
+                horizontal,
+                compact ? 6 : 0,
+                horizontal,
+                compact ? 6 : 0,
+              ),
+              decoration: BoxDecoration(
+                border: Border(bottom: BorderSide(color: p.border)),
+              ),
+              child: compact
+                  ? Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        if (menu != null)
-                          IconButton(
-                            onPressed: menu.onOpen,
-                            tooltip: '打开导航',
-                            icon: const Icon(Icons.menu),
-                            iconSize: 20,
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints.tightFor(
-                              width: 40,
-                              height: 40,
+                        Row(
+                          children: [
+                            if (menu != null)
+                              IconButton(
+                                key: const ValueKey('open-drawer'),
+                                onPressed: menu.onOpen,
+                                tooltip: '打开导航',
+                                icon: const Icon(Icons.menu),
+                                iconSize: 20,
+                                padding: EdgeInsets.zero,
+                                constraints: const BoxConstraints.tightFor(
+                                  width: 40,
+                                  height: 40,
+                                ),
+                              ),
+                            Expanded(child: titleBlock),
+                          ],
+                        ),
+                        if (themedActions != null)
+                          SizedBox(
+                            height: 40,
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: themedActions,
                             ),
                           ),
+                      ],
+                    )
+                  : Row(
+                      children: [
                         Expanded(child: titleBlock),
+                        if (themedActions != null)
+                          Flexible(
+                            fit: FlexFit.loose,
+                            child: SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              reverse: true,
+                              child: themedActions,
+                            ),
+                          ),
                       ],
                     ),
-                    if (themedActions != null)
-                      SizedBox(
-                        height: 40,
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: themedActions,
-                        ),
-                      ),
-                  ],
-                )
-              : Row(
-                  children: [
-                    Expanded(child: titleBlock),
-                    if (themedActions != null)
-                      Flexible(
-                        fit: FlexFit.loose,
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          reverse: true,
-                          child: themedActions,
-                        ),
-                      ),
-                  ],
+            ),
+            Expanded(
+              child: Padding(
+                padding: EdgeInsets.all(
+                  compact ? 10 : HaloMetrics.contentPadding,
                 ),
-        ),
-        Expanded(
-          child: Padding(
-            padding: EdgeInsets.all(compact ? 10 : HaloMetrics.contentPadding),
-            child: maxContentWidth == null
-                ? child
-                : Align(
-                    alignment: Alignment.topCenter,
-                    child: ConstrainedBox(
-                      constraints: BoxConstraints(maxWidth: maxContentWidth!),
-                      child: child,
-                    ),
-                  ),
-          ),
-        ),
-      ],
+                child: maxContentWidth == null
+                    ? child
+                    : Align(
+                        alignment: Alignment.topCenter,
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(
+                            maxWidth: maxContentWidth!,
+                          ),
+                          child: child,
+                        ),
+                      ),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 

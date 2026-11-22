@@ -139,8 +139,12 @@ void main() {
         (r) => (r['domain_suffix'] as List?)?.contains('example.com') ?? false,
         'user rule',
       );
-      expect(sniffAt, 0,
-          reason: 'sniffing must run before every matcher that needs a domain');
+      expect(sniffAt, greaterThan(privateAt),
+          reason: 'known direct traffic must not wait for protocol sniffing');
+      expect(sniffAt, greaterThan(dnsAt),
+          reason: 'DNS traffic must not wait for protocol sniffing');
+      expect(sniffAt, lessThan(userAt),
+          reason: 'sniffing must run before domain rules that depend on it');
       expect(userAt, greaterThan(privateAt),
           reason: 'a user rule must not be able to shadow the LAN guard');
       expect(userAt, greaterThan(dnsAt),
@@ -161,6 +165,46 @@ void main() {
       final encoded = jsonEncode(rules);
       expect(encoded.indexOf('first.com'), lessThan(encoded.indexOf('second.com')));
       expect(encoded.indexOf('second.com'), lessThan(encoded.indexOf('third.com')));
+    });
+
+    test('fake-IP resolves only before rules that need a destination IP', () {
+      final rules = rulesOf(
+        ConfigRequest(
+          node: node(),
+          dns: const DnsSettings(fakeAddress: true),
+          rules: [
+            rule(RuleKind.domainSuffix, 'domain.example', action: RuleAction.proxy),
+            rule(RuleKind.ruleSet, 'geoip-cn', action: RuleAction.direct),
+            rule(RuleKind.ipCidr, '10.0.0.0/8', action: RuleAction.direct),
+          ],
+        ),
+      );
+      final domainAt = rules.indexWhere(
+        (item) => (item['domain_suffix'] as List?)?.contains('domain.example') ?? false,
+      );
+      final geoAt = rules.indexWhere(
+        (item) => (item['rule_set'] as List?)?.contains('geoip-cn') ?? false,
+      );
+      final ipAt = rules.indexWhere(
+        (item) => (item['ip_cidr'] as List?)?.contains('10.0.0.0/8') ?? false,
+      );
+      expect(domainAt, greaterThanOrEqualTo(0));
+      expect(geoAt, greaterThan(domainAt));
+      expect(ipAt, greaterThan(geoAt));
+      expect(rules[domainAt - 1]['action'], 'sniff');
+      expect(rules[geoAt - 1], {'action': 'resolve'});
+      expect(rules[ipAt - 1], {'action': 'resolve'});
+
+      final literalRules = rulesOf(
+        ConfigRequest(
+          node: node(),
+          dns: const DnsSettings(fakeAddress: false),
+          rules: [
+            rule(RuleKind.ruleSet, 'geoip-cn', action: RuleAction.direct),
+          ],
+        ),
+      );
+      expect(literalRules.where((item) => item['action'] == 'resolve'), isEmpty);
     });
 
     test('disabled rules are absent from the document', () {

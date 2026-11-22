@@ -195,32 +195,34 @@ void main() {
   });
 
   testWidgets('a narrow window does not overflow', (tester) async {
-    tester.view.physicalSize = const Size(1180, 760);
-    tester.view.devicePixelRatio = 2.0;
     addTearDown(tester.view.reset);
-
-    await tester.pumpWidget(
-      MaterialApp(
-        theme: buildHaloTheme(Brightness.light),
-        home: Scaffold(
-          body: ConnectionsPage(
-            controller: controller(),
-            load: () async => sample(),
+    for (final viewport in [
+      (physical: const Size(1180, 760), ratio: 2.0),
+      (physical: const Size(360, 800), ratio: 1.0),
+    ]) {
+      tester.view.physicalSize = viewport.physical;
+      tester.view.devicePixelRatio = viewport.ratio;
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildHaloTheme(Brightness.light),
+          home: Scaffold(
+            body: ConnectionsPage(
+              controller: controller(),
+              load: () async => sample(),
+            ),
           ),
         ),
-      ),
-    );
-    await tester.pump(const Duration(milliseconds: 50));
-    expect(tester.takeException(), isNull);
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+      expect(tester.takeException(), isNull, reason: '${viewport.physical}');
+    }
 
     await tester.pumpWidget(const SizedBox());
   });
 
   testWidgets('the speed strip shows both directions', (tester) async {
     // The feature the page exists for beyond the list: how fast, right now.
-    await tester.pumpWidget(
-      harness(controller(), () async => sample()),
-    );
+    await tester.pumpWidget(harness(controller(), () async => sample()));
     await tester.pump(const Duration(milliseconds: 50));
 
     expect(find.text('上行'), findsOneWidget);
@@ -231,9 +233,7 @@ void main() {
   });
 
   testWidgets('Ctrl+A selects every visible row', (tester) async {
-    await tester.pumpWidget(
-      harness(controller(), () async => sample()),
-    );
+    await tester.pumpWidget(harness(controller(), () async => sample()));
     await tester.pump(const Duration(milliseconds: 50));
 
     await tester.sendKeyDownEvent(LogicalKeyboardKey.controlLeft);
@@ -252,9 +252,7 @@ void main() {
   });
 
   testWidgets('arrow keys move the selection', (tester) async {
-    await tester.pumpWidget(
-      harness(controller(), () async => sample()),
-    );
+    await tester.pumpWidget(harness(controller(), () async => sample()));
     await tester.pump(const Duration(milliseconds: 50));
 
     await tester.sendKeyEvent(LogicalKeyboardKey.arrowDown);
@@ -268,9 +266,7 @@ void main() {
     // The node table learned this the hard way: a resizer laid out inside a Row
     // with no explicit height has an empty hit area and cannot be dragged, and
     // the enclosing scroll view wins the horizontal gesture on top of that.
-    await tester.pumpWidget(
-      harness(controller(), () async => sample()),
-    );
+    await tester.pumpWidget(harness(controller(), () async => sample()));
     await tester.pump(const Duration(milliseconds: 50));
 
     final handles = find.byWidgetPredicate(
@@ -279,15 +275,11 @@ void main() {
     expect(handles, findsWidgets, reason: '每个列边界都应可拖动');
     for (final element in handles.evaluate()) {
       final rect = tester.getRect(find.byWidget(element.widget));
-      expect(rect.height, greaterThan(16),
-          reason: '拖动条必须有可命中的高度，否则拖不动');
+      expect(rect.height, greaterThan(16), reason: '拖动条必须有可命中的高度，否则拖不动');
     }
 
     final before = tester.getTopLeft(find.text('进程')).dx;
-    await tester.dragFrom(
-      tester.getCenter(handles.first),
-      const Offset(30, 0),
-    );
+    await tester.dragFrom(tester.getCenter(handles.first), const Offset(30, 0));
     await tester.pump(const Duration(milliseconds: 100));
     final after = tester.getTopLeft(find.text('进程')).dx;
     expect(after, greaterThan(before), reason: '拖动后右侧列应整体右移');
@@ -301,9 +293,7 @@ void main() {
     // A clipped heading still reports its full string through find.text, so the
     // check has to compare the glyphs' intrinsic width with the space the cell
     // gave them.
-    await tester.pumpWidget(
-      harness(controller(), () async => sample()),
-    );
+    await tester.pumpWidget(harness(controller(), () async => sample()));
     await tester.pump(const Duration(milliseconds: 50));
 
     for (final heading in ['主机', '进程', '规则', '代理链', '流量', '上速', '下速', '时长']) {
@@ -317,9 +307,13 @@ void main() {
       final needed = painter.width;
       final available = tester.getRect(finder.first).width;
       painter.dispose();
-      expect(available + 1, greaterThanOrEqualTo(needed),
-          reason: '表头「$heading」需要 ${needed.toStringAsFixed(1)}px，'
-              '实际只有 ${available.toStringAsFixed(1)}px');
+      expect(
+        available + 1,
+        greaterThanOrEqualTo(needed),
+        reason:
+            '表头「$heading」需要 ${needed.toStringAsFixed(1)}px，'
+            '实际只有 ${available.toStringAsFixed(1)}px',
+      );
     }
 
     await tester.pumpWidget(const SizedBox());

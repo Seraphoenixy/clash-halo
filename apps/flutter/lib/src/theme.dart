@@ -203,6 +203,16 @@ abstract final class HaloMetrics {
 
   /// Width of the icon-only rail after the user collapses the sidebar.
   static const sidebarCollapsedWidth = 56.0;
+
+  /// Whole-window breakpoints for the application shell.
+  ///
+  /// Expanded navigation needs enough room to leave a useful page column.
+  /// Medium windows keep a compact icon rail; phone-width layouts use a drawer.
+  static const desktopRailBreakpoint = 1180.0;
+  static const drawerBreakpoint = 840.0;
+
+  /// Page-local breakpoint measured after the rail has consumed its width.
+  static const compactPageBreakpoint = 760.0;
   static const logoBarHeight = 56.0;
 
   /// The header row above every page. One 32px control tall plus the

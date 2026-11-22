@@ -301,6 +301,8 @@ void main() {
 
       // The two new settings and the copy button must be reachable.
       expect(find.text('日志级别'), findsOneWidget);
+      expect(find.text('低延迟 DNS（Fake-IP）'), findsOneWidget);
+      expect(find.text('局域网 IP 白名单'), findsOneWidget);
       expect(find.text('IPv6'), findsOneWidget);
       expect(find.text('测速并发'), findsOneWidget);
       // Nothing stored yet, so the dropdown shows the default, not 4.
@@ -308,6 +310,30 @@ void main() {
       expect(find.text('复制诊断信息'), findsOneWidget);
       // Read-only, never a control: the host owns the rotation size.
       expect(find.textContaining('2 MiB'), findsWidgets);
+    });
+
+    testWidgets('fake-IP defaults on and the toggle persists', (tester) async {
+      tester.view.physicalSize = const Size(1600, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildHaloTheme(Brightness.light),
+          home: Scaffold(
+            body: SizedBox(
+              width: 1200,
+              height: 2200,
+              child: SettingsPage(controller: controller),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(RoutingSettings.load(controller.settingsRepo).fakeIp, isTrue);
+      await tester.tap(find.byKey(const ValueKey('fake-ip')));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(RoutingSettings.load(controller.settingsRepo).fakeIp, isFalse);
     });
 
     testWidgets('IPv6 defaults off and the toggle persists', (tester) async {
@@ -332,6 +358,49 @@ void main() {
       await tester.tap(find.byKey(const ValueKey('ipv6')));
       await tester.pump(const Duration(milliseconds: 100));
       expect(RoutingSettings.load(controller.settingsRepo).ipv6, isTrue);
+    });
+
+    testWidgets('LAN allowlist validates CIDRs and persists', (tester) async {
+      tester.view.physicalSize = const Size(1600, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: buildHaloTheme(Brightness.light),
+          home: Scaffold(
+            body: SizedBox(
+              width: 1200,
+              height: 2200,
+              child: SettingsPage(controller: controller),
+            ),
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+
+      await tester.tap(find.byKey(const ValueKey('lan-cidrs-edit')));
+      await tester.pumpAndSettle();
+      final input = find.byKey(const ValueKey('lan-cidrs-input'));
+      await tester.enterText(
+        input,
+        '100.64.0.0/10\nFD7A:115C:A1E0::/48\ninvalid',
+      );
+      await tester.pump();
+      expect(
+        tester
+            .widget<FilledButton>(find.byKey(const ValueKey('lan-cidrs-save')))
+            .onPressed,
+        isNull,
+      );
+
+      await tester.enterText(input, '100.64.0.0/10\nFD7A:115C:A1E0::/48');
+      await tester.pump();
+      await tester.tap(find.byKey(const ValueKey('lan-cidrs-save')));
+      await tester.pumpAndSettle();
+      expect(RoutingSettings.load(controller.settingsRepo).lanCidrs, [
+        '100.64.0.0/10',
+        'fd7a:115c:a1e0::/48',
+      ]);
     });
 
     testWidgets('the about card carries versions, not build-status prose', (

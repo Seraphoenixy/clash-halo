@@ -249,34 +249,56 @@ class _RulesPageState extends State<RulesPage> {
                       children: [
                         Padding(
                           padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
-                          child: Row(
-                            children: [
-                              Text(
-                                '规则列表',
-                                style: TextStyle(
-                                  fontSize: 12.5,
-                                  fontWeight: FontWeight.w600,
-                                  color: p.textPrimary,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                '从上到下依次匹配',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: p.textTertiary,
-                                ),
-                              ),
-                              const Spacer(),
-                              if (c.activeNodeId == null)
-                                Text(
-                                  '尚未选择节点，规则保存后不会立即生效',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: p.textTertiary,
+                          child: LayoutBuilder(
+                            builder: (context, constraints) {
+                              final title = Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    '规则列表',
+                                    style: TextStyle(
+                                      fontSize: 12.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: p.textPrimary,
+                                    ),
                                   ),
-                                ),
-                            ],
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    '从上到下依次匹配',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: p.textTertiary,
+                                    ),
+                                  ),
+                                ],
+                              );
+                              final nodeHint = c.activeNodeId == null
+                                  ? Text(
+                                      '尚未选择节点，规则保存后不会立即生效',
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        color: p.textTertiary,
+                                      ),
+                                    )
+                                  : null;
+                              if (constraints.maxWidth < 520) {
+                                return Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    title,
+                                    if (nodeHint != null) ...[
+                                      const SizedBox(height: 2),
+                                      nodeHint,
+                                    ],
+                                  ],
+                                );
+                              }
+                              return Row(
+                                children: [title, const Spacer(), ?nodeHint],
+                              );
+                            },
                           ),
                         ),
                         const Divider(height: 1),
@@ -418,132 +440,187 @@ class _RuleRow extends StatelessWidget {
     final p = HaloPalette.of(context);
     final dim = !rule.enabled;
     final direct = rule.action == RuleAction.direct;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 26,
-            child: Text(
-              '${index + 1}',
-              style: TextStyle(fontSize: 11.5, color: p.textTertiary),
+    final details = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: p.pressed,
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(
+                rule.kind.label,
+                style: TextStyle(fontSize: 10.5, color: p.textSecondary),
+              ),
             ),
-          ),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 1,
-                      ),
-                      decoration: BoxDecoration(
-                        color: p.pressed,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Text(
-                        rule.kind.label,
-                        style: TextStyle(
-                          fontSize: 10.5,
-                          color: p.textSecondary,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Flexible(
-                      child: Text(
-                        // A rule-set rule's value is an internal tag
-                        // (`geosite-youtube`). The list shows the label the user
-                        // picked, with the tag kept after it so the stored value
-                        // is still visible for anyone comparing with the
-                        // generated document.
-                        rule.kind == RuleKind.ruleSet
-                            ? _ruleSetLabel(rule.value)
-                            : rule.value,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12.5,
-                          fontFamily: rule.kind == RuleKind.ruleSet
-                              ? null
-                              : 'Consolas',
-                          color: dim ? p.textTertiary : p.textPrimary,
-                          decoration: dim ? TextDecoration.lineThrough : null,
-                        ),
-                      ),
-                    ),
-                  ],
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                // A rule-set value is an internal tag; show its readable label
+                // and keep the stored value visible for document comparison.
+                rule.kind == RuleKind.ruleSet
+                    ? _ruleSetLabel(rule.value)
+                    : rule.value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontFamily: rule.kind == RuleKind.ruleSet ? null : 'Consolas',
+                  color: dim ? p.textTertiary : p.textPrimary,
+                  decoration: dim ? TextDecoration.lineThrough : null,
                 ),
-                if (rule.note.isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Text(
-                      rule.note,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(fontSize: 11, color: p.textTertiary),
-                    ),
-                  ),
-              ],
+              ),
+            ),
+          ],
+        ),
+        if (rule.note.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text(
+              rule.note,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 11, color: p.textTertiary),
             ),
           ),
-          // A StatusChip, not a hand-drawn pill: the hand-drawn one had its own
-          // radius (10 vs 4+4), its own alpha (0.14 vs 0.10/0.18) and its own
-          // text size, so the same kind of label looked different here than on
-          // every other page that shows a state.
-          StatusChip(
-            label: rule.action.label,
-            color: direct ? HaloColors.lightTextSecondary : HaloColors.primary,
+      ],
+    );
+    final toggle = IconButton(
+      onPressed: busy ? null : () => onToggle(!rule.enabled),
+      tooltip: rule.enabled ? '停用这条规则' : '启用这条规则',
+      iconSize: 16,
+      visualDensity: VisualDensity.compact,
+      icon: Icon(
+        rule.enabled ? Icons.toggle_on_outlined : Icons.toggle_off_outlined,
+        color: rule.enabled ? p.accent : p.textTertiary,
+      ),
+    );
+    final status = StatusChip(
+      label: rule.action.label,
+      color: direct ? HaloColors.lightTextSecondary : HaloColors.primary,
+    );
+    final up = IconButton(
+      onPressed: busy || index == 0 ? null : onUp,
+      tooltip: '上移',
+      iconSize: 16,
+      visualDensity: VisualDensity.compact,
+      icon: const Icon(Icons.arrow_upward),
+    );
+    final down = IconButton(
+      onPressed: busy || index == total - 1 ? null : onDown,
+      tooltip: '下移',
+      iconSize: 16,
+      visualDensity: VisualDensity.compact,
+      icon: const Icon(Icons.arrow_downward),
+    );
+    final edit = IconButton(
+      onPressed: busy ? null : onEdit,
+      tooltip: '编辑规则',
+      iconSize: 16,
+      visualDensity: VisualDensity.compact,
+      icon: const Icon(Icons.edit_outlined),
+    );
+    final remove = IconButton(
+      onPressed: busy ? null : onRemove,
+      tooltip: '删除规则',
+      iconSize: 16,
+      visualDensity: VisualDensity.compact,
+      icon: Icon(
+        Icons.delete_outline,
+        color: haloAdapt(context, HaloColors.danger),
+      ),
+    );
+
+    Future<void> showMore(BuildContext contextWidget) async {
+      final box = contextWidget.findRenderObject() as RenderBox?;
+      if (box == null) return;
+      final picked = await showHaloMenu<String>(
+        context: context,
+        position:
+            box.localToGlobal(Offset.zero) + box.size.bottomRight(Offset.zero),
+        entries: [
+          HaloMenuItem(
+            value: 'up',
+            label: '上移',
+            icon: Icons.arrow_upward,
+            enabled: !busy && index > 0,
           ),
-          const SizedBox(width: 4),
-          IconButton(
-            onPressed: busy ? null : () => onToggle(!rule.enabled),
-            tooltip: rule.enabled ? '停用这条规则' : '启用这条规则',
-            iconSize: 16,
-            visualDensity: VisualDensity.compact,
-            icon: Icon(
-              rule.enabled
-                  ? Icons.toggle_on_outlined
-                  : Icons.toggle_off_outlined,
-              color: rule.enabled ? p.accent : p.textTertiary,
-            ),
+          HaloMenuItem(
+            value: 'down',
+            label: '下移',
+            icon: Icons.arrow_downward,
+            enabled: !busy && index < total - 1,
           ),
-          IconButton(
-            onPressed: busy || index == 0 ? null : onUp,
-            tooltip: '上移',
-            iconSize: 16,
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.arrow_upward),
+          const HaloMenuDivider(),
+          HaloMenuItem(
+            value: 'edit',
+            label: '编辑规则',
+            icon: Icons.edit_outlined,
+            enabled: !busy,
           ),
-          IconButton(
-            onPressed: busy || index == total - 1 ? null : onDown,
-            tooltip: '下移',
-            iconSize: 16,
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.arrow_downward),
-          ),
-          IconButton(
-            onPressed: busy ? null : onEdit,
-            tooltip: '编辑规则',
-            iconSize: 16,
-            visualDensity: VisualDensity.compact,
-            icon: const Icon(Icons.edit_outlined),
-          ),
-          IconButton(
-            onPressed: busy ? null : onRemove,
-            tooltip: '删除规则',
-            iconSize: 16,
-            visualDensity: VisualDensity.compact,
-            icon: Icon(
-              Icons.delete_outline,
-              color: haloAdapt(context, HaloColors.danger),
-            ),
+          HaloMenuItem(
+            value: 'delete',
+            label: '删除规则',
+            icon: Icons.delete_outline,
+            danger: true,
+            enabled: !busy,
           ),
         ],
-      ),
+      );
+      if (!context.mounted) return;
+      switch (picked) {
+        case 'up':
+          onUp();
+        case 'down':
+          onDown();
+        case 'edit':
+          onEdit();
+        case 'delete':
+          onRemove();
+      }
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final compact = constraints.maxWidth < 520;
+        return Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+          child: Row(
+            children: [
+              SizedBox(
+                width: compact ? 22 : 26,
+                child: Text(
+                  '${index + 1}',
+                  style: TextStyle(fontSize: 11.5, color: p.textTertiary),
+                ),
+              ),
+              Expanded(child: details),
+              status,
+              const SizedBox(width: 4),
+              toggle,
+              if (compact)
+                Builder(
+                  builder: (buttonContext) => IconButton(
+                    onPressed: busy ? null : () => showMore(buttonContext),
+                    tooltip: '更多规则操作',
+                    iconSize: 16,
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.more_horiz),
+                  ),
+                )
+              else ...[
+                up,
+                down,
+                edit,
+                remove,
+              ],
+            ],
+          ),
+        );
+      },
     );
   }
 }

@@ -42,8 +42,9 @@ class RoutingSettings {
     this.dnsEnabled = true,
     this.dnsServer = 'https://223.5.5.5/dns-query',
     this.directDns = '223.5.5.5',
-    this.fakeIp = false,
+    this.fakeIp = true,
     this.ipv6 = false,
+    this.lanCidrs = const [],
     this.logLevel = 'warn',
     this.rules = const [],
   });
@@ -62,6 +63,13 @@ class RoutingSettings {
   /// IPv6-capable node and network.
   final bool ipv6;
 
+  /// Destination CIDRs that always bypass the proxy.
+  ///
+  /// This is intentionally separate from the ordered user rules: it also
+  /// applies in global mode, and sits before protocol sniffing so local traffic
+  /// never pays the sniff timeout.
+  final List<String> lanCidrs;
+
   /// `log.level` of the generated document. Lower levels make the core write
   /// more, which is why `debug` is offered with a warning rather than as a
   /// default.
@@ -77,8 +85,13 @@ class RoutingSettings {
   static const _kDnsEnabled = 'routing.dnsEnabled';
   static const _kDnsServer = 'routing.dnsServer';
   static const _kDirectDns = 'routing.directDns';
-  static const _kFakeIp = 'routing.fakeIp';
+  // The old key was persisted but never consumed by the generator, so a
+  // stored `0` was a default, not a user preference. The versioned key makes
+  // the working Fake-IP feature default on for upgraded installations while
+  // preserving later user choices.
+  static const _kFakeIp = 'routing.fakeIp.v1';
   static const _kIpv6 = 'routing.ipv6';
+  static const _kLanCidrs = 'routing.lanCidrs.v1';
   static const _kLogLevel = 'routing.logLevel';
   static const _kRules = 'routing.rules';
 
@@ -99,6 +112,7 @@ class RoutingSettings {
       directDns: repo.raw(_kDirectDns) ?? defaults.directDns,
       fakeIp: _bool(repo.raw(_kFakeIp), defaults.fakeIp),
       ipv6: _bool(repo.raw(_kIpv6), defaults.ipv6),
+      lanCidrs: _cidrs(repo.raw(_kLanCidrs)),
       logLevel: normalizeLogLevel(repo.raw(_kLogLevel)),
       // A missing key is "never configured", not "no rules": the two must not
       // be conflated. An empty stored array is a user who deleted every rule,
@@ -158,6 +172,24 @@ class RoutingSettings {
     }
   }
 
+  static List<String> _cidrs(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return const [];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const [];
+      final seen = <String>{};
+      return [
+        for (final item in decoded)
+          if (item is String &&
+              validateRuleValue(RuleKind.ipCidr, item) == null &&
+              seen.add(item.trim().toLowerCase()))
+            item.trim().toLowerCase(),
+      ];
+    } on FormatException {
+      return const [];
+    }
+  }
+
   void save(SettingsRepository repo) {
     repo.setRaw(_kMode, mode.wire);
     repo.setRaw(_kMixed, '$mixedPort');
@@ -168,6 +200,7 @@ class RoutingSettings {
     repo.setRaw(_kDirectDns, directDns);
     repo.setRaw(_kFakeIp, fakeIp ? '1' : '0');
     repo.setRaw(_kIpv6, ipv6 ? '1' : '0');
+    repo.setRaw(_kLanCidrs, jsonEncode(lanCidrs));
     repo.setRaw(_kLogLevel, logLevel);
     repo.setRaw(_kRules, jsonEncode([for (final r in rules) r.toJson()]));
   }
@@ -182,6 +215,7 @@ class RoutingSettings {
     String? directDns,
     bool? fakeIp,
     bool? ipv6,
+    List<String>? lanCidrs,
     String? logLevel,
     List<RoutingRule>? rules,
   }) => RoutingSettings(
@@ -194,6 +228,7 @@ class RoutingSettings {
     directDns: directDns ?? this.directDns,
     fakeIp: fakeIp ?? this.fakeIp,
     ipv6: ipv6 ?? this.ipv6,
+    lanCidrs: lanCidrs ?? this.lanCidrs,
     logLevel: logLevel ?? this.logLevel,
     rules: rules ?? this.rules,
   );
@@ -225,6 +260,7 @@ class RoutingSettings {
           ipv6: ipv6,
         ),
         tun: TunSettings(enabled: withTun),
+        lanCidrs: lanCidrs,
         // The generator has carried this parameter all along; nothing passed it,
         // so every document said `warn` no matter what the user chose.
         logLevel: logLevel,
@@ -265,12 +301,22 @@ class RoutingSettings {
       other.directDns == directDns &&
       other.fakeIp == fakeIp &&
       other.ipv6 == ipv6 &&
+      _sameStrings(other.lanCidrs, lanCidrs) &&
       other.logLevel == logLevel &&
       _sameRules(other.rules, rules);
 
   /// Orders matter: the same rules in a different order route traffic
   /// differently, so a reorder has to count as a change.
   static bool _sameRules(List<RoutingRule> a, List<RoutingRule> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  static bool _sameStrings(List<String> a, List<String> b) {
     if (identical(a, b)) return true;
     if (a.length != b.length) return false;
     for (var i = 0; i < a.length; i++) {
@@ -290,6 +336,7 @@ class RoutingSettings {
     directDns,
     fakeIp,
     ipv6,
+    Object.hashAll(lanCidrs),
     logLevel,
     Object.hashAll(rules),
   );

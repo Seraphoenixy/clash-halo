@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -464,9 +465,19 @@ func TestClientCountTracksConnections(t *testing.T) {
 	if srv.ClientCount() != 0 {
 		t.Fatalf("clients not cleaned up: %d", srv.ClientCount())
 	}
+	for i := 0; i < 120; i++ {
+		mu.Lock()
+		n := len(counts)
+		mu.Unlock()
+		if n >= 4 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(counts) == 0 || counts[len(counts)-1] != 0 {
+	want := []int{1, 2, 1, 0}
+	if !slices.Equal(counts, want) {
 		t.Fatalf("client change callback = %v", counts)
 	}
 }

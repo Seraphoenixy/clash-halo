@@ -2,11 +2,11 @@ name: Build and Release
 
 # 与 D:\project\Ygdria 的 .github/workflows/build.yml 同构：
 #
-#   metadata → verify → windows → release
+#   metadata → verify → windows/android → release
 #
 # 沿用的部分：tag（v*）或手动触发才出包、`needs` 串起来的依赖链、产物按固定名字
 # 上传、tag 构建末尾创建 draft release。不同的部分全部来自本项目的形态，写在下面
-# 每一步的注释里，最主要的三条是：
+# 每一步的注释里，最主要的是：
 #
 #   1. `.tools/` 不入库（.gitignore 第 1 行），本地那套 go/flutter 在 CI 里不存在，
 #      必须按版本装一套。
@@ -14,6 +14,8 @@ name: Build and Release
 #      必须从官方 release 下载并按 digest 校验——它是产品的一部分，不能"拿不到就跳过"。
 #   3. Windows 产物不是一个自包含前端，而是「外壳 + data/app.so + 自制宿主 + 第三方
 #      内核」，所以构建之后必须核对载荷，而不是看退出码。
+#   4. Android 的 libbox 是 gitignored 的本地产物。release 必须先从锁定的 sing-box
+#      commit 构建 arm64 AAR，再验证 APK 只带这个 ABI。
 
 on:
   push:
@@ -34,11 +36,18 @@ env:
   # 新版本能构建，否则 CI 会先于开发者发现不兼容。
   FLUTTER_VERSION: "3.47.9"
   GO_VERSION: "1.27.3"
+  # v1.14.4 官方 Android workflow 使用这个 Go 版本构建 gomobile 绑定。gomobile
+  # 紧贴 Go 内部实现，不能让 Android 产物跟随 Windows 宿主的升级而漂移。
+  LIBBOX_GO_VERSION: "1.26.10"
   # sing-box 的版本与 digest 来自官方 release：
   #   https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.14.4
   # digest 不是可选项：这个二进制会被安装包分发，也会由提权助手执行。
   SING_BOX_VERSION: "1.14.4"
   SING_BOX_ZIP_SHA256: "99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df"
+  # Android 的 libbox 从同一个 sing-box tag 构建。提交哈希比移动 tag 更适合
+  # 作为 CI 缓存键，也把真正参与编译的源码钉死到一个 commit。
+  SING_BOX_COMMIT: "c005f35300ce76427dc285481ec5695f5b179cd2"
+  ANDROID_NDK_VERSION: "28.2.13676358"
 
 jobs:
   metadata:
@@ -273,15 +282,174 @@ jobs:
           path: release/ClashHalo-windows-setup-*.exe
           if-no-files-found: error
 
+  android:
+    name: Build Android APK
+    needs: [metadata, verify]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      SHORT_HASH: ${{ needs.metadata.outputs.short_hash }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.LIBBOX_GO_VERSION }}
+          # The repository's go.sum belongs to native/windows. libbox has its
+          # own module in a temporary checkout below and is cached separately.
+          cache: false
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Android SDK platform and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" "platforms;android-36"
+          ndk_root="$sdk_root/ndk/${ANDROID_NDK_VERSION}"
+          if [[ ! -x "$ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]]; then
+            "$sdkmanager" "ndk;${ANDROID_NDK_VERSION}"
+          fi
+          {
+            echo "ANDROID_HOME=$sdk_root"
+            echo "ANDROID_SDK_ROOT=$sdk_root"
+            echo "ANDROID_NDK_HOME=$ndk_root"
+            echo "ANDROID_NDK_ROOT=$ndk_root"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Restore locked libbox
+        id: libbox-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            native/android/vpn/libs/libbox.jar
+            native/android/vpn/src/main/jniLibs/arm64-v8a/libbox.so
+          key: libbox-android-arm64-${{ env.SING_BOX_COMMIT }}-${{ env.LIBBOX_GO_VERSION }}-v1
+
+      - name: Build locked libbox
+        if: steps.libbox-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/sing-box"
+          rm -rf "$source_dir"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://github.com/SagerNet/sing-box.git
+          git -C "$source_dir" fetch --depth=1 origin "$SING_BOX_COMMIT"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          test "$(git -C "$source_dir" rev-parse HEAD)" = "$SING_BOX_COMMIT"
+
+          make -C "$source_dir" lib_install
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          (
+            cd "$source_dir"
+            go run ./cmd/internal/build_libbox \
+              -target android \
+              -platform android/arm64
+          )
+
+          unpack_dir="$RUNNER_TEMP/libbox-aar"
+          rm -rf "$unpack_dir"
+          mkdir -p "$unpack_dir"
+          unzip -q "$source_dir/libbox.aar" -d "$unpack_dir"
+          mkdir -p native/android/vpn/libs
+          mkdir -p native/android/vpn/src/main/jniLibs/arm64-v8a
+          cp "$unpack_dir/classes.jar" native/android/vpn/libs/libbox.jar
+          cp "$unpack_dir/jni/arm64-v8a/libbox.so" \
+            native/android/vpn/src/main/jniLibs/arm64-v8a/libbox.so
+
+      - name: Verify locked libbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s native/android/vpn/libs/libbox.jar
+          test -s native/android/vpn/src/main/jniLibs/arm64-v8a/libbox.so
+          file native/android/vpn/src/main/jniLibs/arm64-v8a/libbox.so |
+            grep -q 'ARM aarch64'
+
+      - name: Resolve Dart dependencies
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: apps/flutter
+        run: |
+          flutter build apk \
+            --release \
+            --target-platform android-arm64 \
+            --no-pub
+
+      - name: Verify APK payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="apps/flutter/build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$apk"
+          entries="$(unzip -Z1 "$apk")"
+          grep -qx 'lib/arm64-v8a/libapp.so' <<< "$entries"
+          grep -qx 'lib/arm64-v8a/libbox.so' <<< "$entries"
+          if grep -Eq '^lib/(armeabi-v7a|x86_64)/' <<< "$entries"; then
+            echo "APK 包含未构建 libbox 的 ABI" >&2
+            exit 1
+          fi
+
+      - name: Stage Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          apk="apps/flutter/build/app/outputs/flutter-apk/app-release.apk"
+          name="ClashHalo-android-v${VERSION}-${SHORT_HASH}.apk"
+          cp "$apk" "release/$name"
+          (
+            cd release
+            sha256sum "$name" > "$name.sha256"
+            ls -lh "$name" "$name.sha256"
+          )
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: ClashHalo-android
+          path: release/ClashHalo-android-*
+          if-no-files-found: error
+
   release:
     name: Create GitHub Release
-    needs: [windows]
+    needs: [windows, android]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # `gh release create --generate-notes` reads commits and tags through
+          # the local Git repository. A shallow checkout would also limit the
+          # range it can inspect when generating release notes.
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download release assets
         uses: actions/download-artifact@v6
         with:

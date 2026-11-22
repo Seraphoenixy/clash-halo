@@ -114,6 +114,7 @@ class HaloSidebar extends StatelessWidget {
               children: [
                 for (final page in HaloPage.values)
                   HaloNavItem(
+                    key: ValueKey('nav-${page.name}'),
                     page: page,
                     selected: page == current,
                     needsAttention: page == blockedPage,

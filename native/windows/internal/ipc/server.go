@@ -91,6 +91,10 @@ type Server struct {
 
 	clientsMu sync.RWMutex
 	clients   map[*Client]struct{}
+	// clientChangeMu orders each client-set mutation with its callback. The
+	// clients mutex alone is not enough: publishing a count after unlocking can
+	// let one removal report 1 after a concurrent removal already reported 0.
+	clientChangeMu sync.Mutex
 
 	// requestCh is the serialisation point: capacity 1 keeps ordering
 	// strict while still letting the accept loop enqueue.
@@ -228,23 +232,8 @@ var readActions = map[string]struct{}{
 
 func (s *Server) handleConn(conn net.Conn) {
 	client := &Client{conn: conn, subscribed: true}
-	s.clientsMu.Lock()
-	s.clients[client] = struct{}{}
-	count := len(s.clients)
-	s.clientsMu.Unlock()
-	if s.onClientChange != nil {
-		s.onClientChange(count)
-	}
-	defer func() {
-		s.clientsMu.Lock()
-		delete(s.clients, client)
-		remaining := len(s.clients)
-		s.clientsMu.Unlock()
-		client.close()
-		if s.onClientChange != nil {
-			s.onClientChange(remaining)
-		}
-	}()
+	s.addClient(client)
+	defer s.removeClient(client)
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 4096), maxRequestBytes)
@@ -331,6 +320,33 @@ func (s *Server) handleConn(conn net.Conn) {
 		case <-s.done:
 			return
 		}
+	}
+}
+
+func (s *Server) addClient(client *Client) {
+	s.clientChangeMu.Lock()
+	defer s.clientChangeMu.Unlock()
+
+	s.clientsMu.Lock()
+	s.clients[client] = struct{}{}
+	count := len(s.clients)
+	s.clientsMu.Unlock()
+	if s.onClientChange != nil {
+		s.onClientChange(count)
+	}
+}
+
+func (s *Server) removeClient(client *Client) {
+	s.clientChangeMu.Lock()
+	defer s.clientChangeMu.Unlock()
+
+	s.clientsMu.Lock()
+	delete(s.clients, client)
+	remaining := len(s.clients)
+	s.clientsMu.Unlock()
+	client.close()
+	if s.onClientChange != nil {
+		s.onClientChange(remaining)
 	}
 }
 

@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:halo_config/halo_config.dart';
 import 'package:halo_contracts/halo_contracts.dart';
 import 'package:halo_storage/halo_storage.dart';
 
@@ -528,6 +529,46 @@ class _SettingsPageState extends State<SettingsPage> {
     }
   }
 
+  Future<void> _setFakeIp(bool value) async {
+    final next = _routing.copyWith(fakeIp: value);
+    setState(() => _routing = next);
+    try {
+      await c.saveRouting(next);
+      if (!mounted) return;
+      _snack(
+        _appliedToCore
+            ? '低延迟 DNS 已${value ? '启用' : '关闭'}，并已重新应用到内核'
+            : '低延迟 DNS 已${value ? '启用' : '关闭'}，将在下次应用配置后生效',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _snack('保存低延迟 DNS 设置失败：$e');
+    }
+  }
+
+  Future<void> _editLanCidrs() async {
+    final values = await showDialog<List<String>>(
+      context: context,
+      builder: (_) => _LanWhitelistDialog(initial: _routing.lanCidrs),
+    );
+    if (values == null) return;
+    final next = _routing.copyWith(lanCidrs: values);
+    setState(() => _routing = next);
+    try {
+      await c.saveRouting(next);
+      if (!mounted) return;
+      final count = values.length;
+      _snack(
+        _appliedToCore
+            ? '局域网白名单已保存为 $count 个网段，并已重新应用到内核'
+            : '局域网白名单已保存为 $count 个网段，将在下次应用配置后生效',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _snack('保存局域网白名单失败：$e');
+    }
+  }
+
   void _setConcurrency(int value) {
     final clamped = AppController.clampConcurrency(value);
     setState(() => _concurrency = clamped);
@@ -612,6 +653,33 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                 ),
                 const SizedBox(height: HaloMetrics.blockGap),
+                _SettingField(
+                  label: '低延迟 DNS（Fake-IP）',
+                  hint: _routing.fakeIp
+                      ? '默认开启：DNS 立即返回合成地址，内核再按真实域名分流并经节点解析，避免 TUN 首次打开网页时等待代理 DNS。'
+                      : '关闭时每个未缓存域名都等待真实 DNS；仅在应用与 Fake-IP 不兼容时关闭。',
+                  trailing: HaloSwitch(
+                    key: const ValueKey('fake-ip'),
+                    value: _routing.fakeIp,
+                    onChanged: c.storeReady ? _setFakeIp : null,
+                  ),
+                ),
+                const SizedBox(height: HaloMetrics.rowGap),
+                _SettingField(
+                  label: '局域网 IP 白名单',
+                  hint: _routing.lanCidrs.isEmpty
+                      ? '未配置额外直连网段。RFC1918 私网仍由内置规则覆盖；这里可添加跨地域内网、Tailscale 等 CIDR。'
+                      : '${_routing.lanCidrs.length} 个网段始终直连：'
+                            '${_routing.lanCidrs.take(3).join('、')}'
+                            '${_routing.lanCidrs.length > 3 ? '…' : ''}',
+                  trailing: OutlinedButton.icon(
+                    key: const ValueKey('lan-cidrs-edit'),
+                    onPressed: c.storeReady ? _editLanCidrs : null,
+                    icon: const Icon(Icons.lan_outlined, size: 17),
+                    label: Text(_routing.lanCidrs.isEmpty ? '配置' : '编辑'),
+                  ),
+                ),
+                const SizedBox(height: HaloMetrics.rowGap),
                 _SettingField(
                   label: 'IPv6',
                   hint: _routing.ipv6
@@ -900,23 +968,137 @@ class _SettingField extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Row(
+    final labelWidget = Text(
+      label,
+      style: Theme.of(context).textTheme.titleSmall,
+    );
+    final hintWidget = Text(
+      hint,
+      style: Theme.of(context).textTheme.bodySmall?.copyWith(height: 1.45),
+    );
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        if (constraints.maxWidth < 480) {
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              labelWidget,
+              const SizedBox(height: HaloMetrics.blockGap),
+              Align(alignment: Alignment.centerRight, child: trailing),
+              const SizedBox(height: HaloMetrics.lineGap),
+              hintWidget,
+            ],
+          );
+        }
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SizedBox(
-              width: 200,
-              child: Text(label, style: Theme.of(context).textTheme.titleSmall),
+            Row(
+              children: [
+                SizedBox(width: 200, child: labelWidget),
+                const SizedBox(width: 16),
+                trailing,
+              ],
             ),
-            const SizedBox(width: 16),
-            trailing,
+            const SizedBox(height: HaloMetrics.lineGap),
+            hintWidget,
+          ],
+        );
+      },
+    );
+  }
+}
+
+/// Edits the LAN bypass list as one CIDR per line.
+///
+/// Validation happens here because `sing-box check` reports a malformed CIDR as
+/// a whole-document failure. Empty input is valid and clears the extra
+/// allowlist; the built-in RFC1918 guard is independent of this setting.
+class _LanWhitelistDialog extends StatefulWidget {
+  const _LanWhitelistDialog({required this.initial});
+
+  final List<String> initial;
+
+  @override
+  State<_LanWhitelistDialog> createState() => _LanWhitelistDialogState();
+}
+
+class _LanWhitelistDialogState extends State<_LanWhitelistDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initial.join('\n'));
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  ({List<String> values, String? error}) get _parsed {
+    final values = <String>[];
+    final seen = <String>{};
+    final tokens = _controller.text
+        .split(RegExp(r'[\s,，;；]+'))
+        .map((value) => value.trim())
+        .where((value) => value.isNotEmpty);
+    for (final token in tokens) {
+      final problem = validateRuleValue(RuleKind.ipCidr, token);
+      if (problem != null) return (values: values, error: '$token：$problem');
+      final normalized = token.toLowerCase();
+      if (seen.add(normalized)) values.add(normalized);
+    }
+    return (values: values, error: null);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final parsed = _parsed;
+    return AlertDialog(
+      title: const Text('局域网 IP 白名单'),
+      content: SizedBox(
+        width: 480,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              '这些目的网段始终直连，并在规则、全局和直连模式下生效。'
+              '支持 IPv4/IPv6 CIDR，可换行或用逗号分隔。',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+            const SizedBox(height: HaloMetrics.blockGap),
+            TextField(
+              key: const ValueKey('lan-cidrs-input'),
+              controller: _controller,
+              autofocus: true,
+              minLines: 5,
+              maxLines: 8,
+              keyboardType: TextInputType.multiline,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+              onChanged: (_) => setState(() {}),
+              decoration: InputDecoration(
+                hintText: '10.0.0.0/8\n100.64.0.0/10\nfd7a:115c:a1e0::/48',
+                errorText: parsed.error,
+              ),
+            ),
           ],
         ),
-        const SizedBox(height: HaloMetrics.lineGap),
-        Text(
-          hint,
-          style: Theme.of(context).textTheme.bodySmall?.copyWith(height: 1.45),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          key: const ValueKey('lan-cidrs-save'),
+          onPressed: parsed.error == null
+              ? () => Navigator.of(context).pop(parsed.values)
+              : null,
+          child: const Text('保存'),
         ),
       ],
     );

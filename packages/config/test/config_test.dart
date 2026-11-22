@@ -120,6 +120,35 @@ void main() {
       expect(dnsRules('203.0.113.7', ipv6: true), isEmpty);
     });
 
+    test('fake-IP returns synthetic A/AAAA addresses and persists mappings', () {
+      final result = buildConfig(
+        ConfigRequest(
+          node: _node(ProxyProtocol.socks, server: 'proxy.example.com'),
+          dns: const DnsSettings(fakeAddress: true),
+        ),
+        CoreCapabilities.singbox114,
+      );
+      expect(result.ok, isTrue);
+      final document = result.config!.document;
+      final dns = document['dns'] as Map;
+      final servers = (dns['servers'] as List).cast<Map>();
+
+      expect(servers.last, {
+        'type': 'fakeip',
+        'tag': 'fakeip',
+        'inet4_range': kFakeIpv4Range,
+      });
+      expect(dns['rules'], [
+        {'domain': ['proxy.example.com'], 'server': 'local'},
+        {'ip_version': 6, 'action': 'predefined', 'rcode': 'NOERROR'},
+        {'query_type': ['A'], 'server': 'fakeip'},
+      ]);
+      expect(
+        (document['experimental'] as Map)['cache_file'],
+        {'enabled': true, 'path': 'halo-cache.db', 'store_fakeip': true},
+      );
+    });
+
     test('emits a single active proxy outbound and system tags', () {
       final node = _node(ProxyProtocol.trojan,
           secrets: {'password': 'pw'},
@@ -165,7 +194,7 @@ void main() {
       expect(result.config!.document.containsKey('dns'), isFalse);
     });
 
-    test('sniff action leads every route mode', () {
+    test('sniff action uses a bounded timeout in every route mode', () {
       final node = _node(ProxyProtocol.socks, server: '1.2.3.4', port: 1080);
       for (final mode in RouteMode.values) {
         final result = buildConfig(
@@ -173,11 +202,31 @@ void main() {
         final rules =
             ((result.config!.document['route'] as Map)['rules'] as List)
                 .cast<Map>();
-        expect(rules.first, {
-          'action': 'sniff',
-          'sniffer': ['tls', 'http', 'quic'],
-          'timeout': '300ms',
-        }, reason: mode.wire);
+        final sniff = rules.singleWhere((rule) => rule['action'] == 'sniff');
+        expect(sniff['sniffer'], ['tls', 'http', 'quic'], reason: mode.wire);
+        expect(sniff['timeout'], '100ms', reason: mode.wire);
+      }
+    });
+
+    test('LAN allowlist is direct before sniff in every route mode', () {
+      final node = _node(ProxyProtocol.socks, server: '1.2.3.4', port: 1080);
+      const cidrs = ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'];
+      for (final mode in RouteMode.values) {
+        final result = buildConfig(
+          ConfigRequest(node: node, mode: mode, lanCidrs: cidrs),
+          CoreCapabilities.singbox114,
+        );
+        final rules =
+            ((result.config!.document['route'] as Map)['rules'] as List)
+                .cast<Map>();
+        final lanAt = rules.indexWhere((rule) {
+          final values = rule['ip_cidr'] as List?;
+          return values != null && cidrs.every(values.contains);
+        });
+        final sniffAt = rules.indexWhere((rule) => rule['action'] == 'sniff');
+        expect(lanAt, greaterThanOrEqualTo(0), reason: mode.wire);
+        expect(rules[lanAt]['outbound'], 'direct', reason: mode.wire);
+        expect(lanAt, lessThan(sniffAt), reason: mode.wire);
       }
     });
 
@@ -413,6 +462,104 @@ void main() {
       file.writeAsStringSync(result.config!.toJsonString());
       final check = Process.runSync(_singbox.path, ['check', '-c', file.path]);
       expect(check.exitCode, 0, reason: '${check.stdout}${check.stderr}');
+    });
+
+    test('fake-IP TUN config passes sing-box check', () {
+      if (!_singbox.existsSync()) return;
+      final dir = Directory.systemTemp.createTempSync('halo-cfg-fakeip-');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final result = buildConfig(
+        ConfigRequest(
+          node: candidates()['trojan']!,
+          dns: const DnsSettings(fakeAddress: true),
+          lanCidrs: const ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'],
+          rules: defaultRules(),
+          tun: const TunSettings(enabled: true),
+        ),
+        CoreCapabilities.singbox114,
+      );
+      final file = File('${dir.path}/fakeip.json');
+      file.writeAsStringSync(result.config!.toJsonString());
+      final check = Process.runSync(_singbox.path, ['check', '-c', file.path]);
+      expect(check.exitCode, 0, reason: '${check.stdout}${check.stderr}');
+    });
+
+    test('fake-IP returns a synthetic address from the real core', () async {
+      if (!_singbox.existsSync()) return;
+      final dir = Directory.systemTemp.createTempSync('halo-cfg-fakeip-run-');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final clashApiPort = await _freePort();
+      final result = buildConfig(
+        ConfigRequest(
+          node: candidates()['trojan']!,
+          dns: const DnsSettings(fakeAddress: true),
+          lanCidrs: const ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'],
+          rules: defaultRules(),
+          ports: InboundPorts(
+            mixed: await _freePort(),
+            clashApi: clashApiPort,
+          ),
+        ),
+        CoreCapabilities.singbox114,
+      );
+      final file = File('${dir.path}/fakeip-run.json');
+      final document = result.config!.document;
+      final logFile = File('${dir.path}/core.log');
+      (document['log'] as Map)['output'] = logFile.path;
+      file.writeAsStringSync(jsonEncode(document));
+
+      final process = await Process.start(
+        _singbox.path,
+        ['run', '-c', file.path, '--disable-color'],
+        workingDirectory: dir.path,
+      );
+      final stdoutDone = process.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach((_) {});
+      final stderrDone = process.stderr
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .forEach((_) {});
+      final exited = process.exitCode;
+      final client = HttpClient();
+      try {
+        var started = false;
+        for (var attempt = 0; attempt < 50; attempt++) {
+          try {
+            final probe = await client.getUrl(
+              Uri.parse('http://127.0.0.1:$clashApiPort/version'),
+            );
+            final response = await probe.close();
+            await response.drain<void>();
+            started = true;
+            break;
+          } catch (_) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
+        }
+        expect(
+          started,
+          isTrue,
+          reason: 'fake-IP 内核启动失败:\n'
+              '${logFile.existsSync() ? logFile.readAsStringSync() : '无核心日志'}',
+        );
+
+        final request = await client.getUrl(Uri.parse(
+          'http://127.0.0.1:$clashApiPort/dns/query'
+          '?name=halo-fakeip-check.example&type=A',
+        ));
+        final response = await request.close();
+        final body = await utf8.decoder.bind(response).join();
+        expect(response.statusCode, 200, reason: body);
+        final payload = jsonDecode(body) as Map<String, Object?>;
+        final answer = (payload['Answer'] as List).single as Map;
+        expect(answer['data'], startsWith('198.18.'));
+      } finally {
+        client.close(force: true);
+        process.kill();
+        await Future.wait([exited, stdoutDone, stderrDone]);
+      }
     });
 
     test('an invalid config is rejected by the real core', () {
